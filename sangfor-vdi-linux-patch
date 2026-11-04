@@ -1,0 +1,1160 @@
+#!/usr/bin/env bash
+#
+# sangfor-vdi-linux-patch
+#
+# 让深信服 aDesk / VDI Linux 客户端跑在现代发行版上（Ubuntu 24.04+、Debian 12+、
+# Fedora 40+、Linux Mint 等）。客户端是在 Ubuntu 16.04/18.04、CentOS 时代构建的，
+# 在新系统上会遇到五类问题，本补丁逐一处理：
+#
+#   1. 依赖 OpenLDAP 2.4（OPENLDAP_2.4_2）—— 新系统只有 OpenLDAP 2.5/2.6，
+#      符号版本变成 OPENLDAP_2.20x，报 "version `OPENLDAP_2.4_2' not found"。
+#   2. 依赖 OpenSSL 1.0（libssl.so.1.0.0 / libssl.so.10）—— 新系统只有 OpenSSL 3，
+#      客户端自带的 1.0.2k 没有版本符号表，会刷 "no version information available"。
+#   3. vdi_super_agent 只认 ubuntu/kylin/uos/centos，读到 ID=linuxmint / debian /
+#      fedora 就 "get system name failed" 后 exit(255)，不建 super_agent.sock，
+#      于是 GUI 判定"另一个登录窗口已在运行"而退出。
+#   4. 依赖 Qt4（libQt*.so.4）—— 多数新发行版已移除；而已知的 rock-core 重打包版
+#      4.8.7+dfsg-7ubuntu4rock8 会在 QMap 迭代中死循环，占满 CPU 且不显示登录框。
+#   5. vdi_session / rapp_session 是 setuid 程序，动态链接器会忽略 LD_LIBRARY_PATH，
+#      加载不到旧库就立即退出，表现为登录成功后"检测到客户端组件连接超时"。
+#
+# 所有改动都在客户端私有目录内完成，不降级系统软件包；唯一触及系统目录的是
+# /etc/ld.so.conf.d 下一个专用文件（第 5 条需要），revert 会完整回滚。
+#
+# 典型用法：
+#   sudo ./sangfor-vdi-linux-patch diagnose   # 看状态，不改动
+#   sudo ./sangfor-vdi-linux-patch apply      # 一键打补丁
+#   sudo ./sangfor-vdi-linux-patch verify     # 验证
+#   sudo ./sangfor-vdi-linux-patch revert     # 撤销
+
+set -o pipefail
+
+PATCH_VERSION="1.0"
+
+CLIENT_DIR="/usr/local/sangfor/vdiclient"
+BIN_DIR="$CLIENT_DIR/bin"
+LIB_DIR="$CLIENT_DIR/lib"
+COMPAT_DIR="$CLIENT_DIR/compat"          # 旧 ABI 兼容库（OpenLDAP 2.4）
+SYSTEMD_DROPIN="/etc/systemd/system/vdi_super_agent.service.d"
+MARKER=".sangfor-vdi-patch"
+
+# 客户端要求的旧符号版本
+NEED_OPENLDAP_VER="OPENLDAP_2.4_2"
+NEED_QT_SONAMES="libQtCore.so.4 libQtGui.so.4 libQtNetwork.so.4 libQtCLucene.so.4"
+
+# 已知有缺陷的 Qt4 判定特征（问题 4）
+KNOWN_BAD_QT_PATTERNS="ubuntu4rock"
+
+# 客户端二进制 RPATH 里写死的 Qt4 位置，放在这里无需任何环境变量即可被找到
+EXPECTED_QT_PREFIX="/usr/local/Trolltech/Qt-4.8.7"
+
+# 可被环境变量覆盖的默认下载源（便于内网镜像）
+# 统一取 Ubuntu 18.04 (bionic) 归档：它是最后一个同时提供 OpenLDAP 2.4、OpenSSL 1.0、
+# 官方 Qt4.8.7 以及兼容 gtk2/libaudio 的 LTS，且构建于 glibc 2.27 上，在现代发行版可直接运行。
+BIONIC_BASE="${BIONIC_BASE:-http://archive.ubuntu.com/ubuntu/pool}"
+OPENLDAP24_DEB_BASE="${OPENLDAP24_DEB_BASE:-$BIONIC_BASE/main/o/openldap}"
+OPENLDAP24_RPM_BASE="${OPENLDAP24_RPM_BASE:-https://dl.fedoraproject.org/pub/archive/epel/8/Everything/x86_64/Packages/o}"
+QT4_DEB_BASE="${QT4_DEB_BASE:-$BIONIC_BASE/universe/q/qt4-x11}"
+OPENSSL10_DEB_BASE="${OPENSSL10_DEB_BASE:-$BIONIC_BASE/main/o/openssl1.0}"
+LIBAUDIO2_DEB_BASE="${LIBAUDIO2_DEB_BASE:-$BIONIC_BASE/main/n/nas}"
+
+# 可选行为
+OPT_FORCE_QT=0
+OPT_SKIP_QT=0
+OPT_ROOT=""
+OPT_ASSUME_YES=0
+OPT_DRY_RUN=0
+OPT_VERBOSE=0
+
+# ---------------------------------------------------------------------------
+# 输出
+# ---------------------------------------------------------------------------
+C_RED="" C_GRN="" C_YEL="" C_BLU="" C_RST=""
+if [ -t 1 ]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_BLU=$'\033[34m'; C_RST=$'\033[0m'
+fi
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s[*]%s %s\n' "$C_BLU" "$C_RST" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*"; }
+err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+dbg()  { [ "$OPT_VERBOSE" -eq 1 ] && printf '[D] %s\n' "$*"; return 0; }
+
+confirm() {
+    [ "$OPT_ASSUME_YES" -eq 1 ] && return 0
+    local answer
+    printf '%s%s%s [y/N] ' "$C_YEL" "$1" "$C_RST"
+    read -r answer
+    case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# 平台检测
+# ---------------------------------------------------------------------------
+detect_platform() {
+    OS_ID=""; OS_VER=""; OS_NAME=""; OS_LIKE=""
+    ARCH="$(uname -m)"
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        OS_ID="${ID:-}"
+        OS_VER="${VERSION_ID:-}"
+        OS_NAME="${NAME:-}"
+        OS_LIKE="${ID_LIKE:-}"
+    fi
+    PKG_FAMILY=""; PKG_MGR=""; PKG_QUERY=""
+    case "$OS_ID" in
+        ubuntu|debian|linuxmint|pop|elementary|zorin|mx|kali|neon|devuan|raspbian)
+            PKG_FAMILY="deb"; PKG_MGR="apt-get"; PKG_QUERY="dpkg-query" ;;
+        fedora|rhel|centos|rocky|almalinux|ol|nobara|amzn)
+            PKG_FAMILY="rpm"; PKG_QUERY="rpm"
+            if command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"; else PKG_MGR="yum"; fi ;;
+        *)
+            case " $OS_LIKE " in
+                *" ubuntu "*|*" debian "*)
+                    PKG_FAMILY="deb"; PKG_MGR="apt-get"; PKG_QUERY="dpkg-query" ;;
+                *" fedora "*|*" rhel "*|*" centos "*)
+                    PKG_FAMILY="rpm"; PKG_QUERY="rpm"
+                    if command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"; else PKG_MGR="yum"; fi ;;
+            esac ;;
+    esac
+    dbg "OS_ID=$OS_ID OS_VER=$OS_VER like='$OS_LIKE' arch=$ARCH pkg=$PKG_FAMILY/$PKG_MGR"
+}
+
+need_root() {
+    if [ -z "$OPT_ROOT" ] && [ "$(id -u)" -ne 0 ]; then
+        die "需要 root 权限，请用 sudo 运行。"
+    fi
+}
+
+# 所有写操作都经过这里，支持 dry-run 与 chroot
+run() {
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'; printf ' %q' "$@"; printf '\n'
+        return 0
+    fi
+    if [ -n "$OPT_ROOT" ]; then
+        chroot "$OPT_ROOT" "$@"
+    else
+        "$@"
+    fi
+}
+
+pkg_install() {
+    [ $# -eq 0 ] && return 0
+    info "安装系统包: $*"
+    case "$PKG_FAMILY" in
+        deb) run env DEBIAN_FRONTEND=noninteractive "$PKG_MGR" install -y -q --no-install-recommends "$@" ;;
+        rpm) run "$PKG_MGR" install -y -q "$@" ;;
+        *)   warn "未知包管理器，跳过安装: $*" ;;
+    esac
+}
+
+pkg_installed() {
+    case "$PKG_FAMILY" in
+        deb) run "$PKG_QUERY" -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed" ;;
+        rpm) run "$PKG_QUERY" -q "$1" >/dev/null 2>&1 ;;
+        *)   return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 问题 1：OpenLDAP 2.4
+# ---------------------------------------------------------------------------
+# 系统里的 libldap_r-2.4.so.2 常常只是指向 OpenLDAP 2.6 的软链，导出的却是
+# OPENLDAP_2.20x，所以不能只看文件名，必须比对符号版本。
+obj_has_openldap24() {
+    local f="$1"
+    [ -f "$f" ] || return 1
+    objdump -p "$f" 2>/dev/null | grep -q "$NEED_OPENLDAP_VER"
+}
+
+system_ldap_ok() {
+    local f
+    for f in $(ldconfig -p 2>/dev/null | awk '/libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2/ {print $NF}'); do
+        obj_has_openldap24 "$f" && return 0
+    done
+    return 1
+}
+
+curl_needs_openldap24() {
+    local curl="$LIB_DIR/libcurl.so.4.4.0"
+    [ -f "$curl" ] || curl="$LIB_DIR/libcurl.so.4"
+    [ -f "$curl" ] || return 1
+    objdump -p "$curl" 2>/dev/null | grep -q "$NEED_OPENLDAP_VER"
+}
+
+# 下载工具选择。--retry 必须有上限，否则源端限速时会长时间挂住。
+_fetch() {
+    local url="$1" out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --max-time 180 --retry 2 --retry-delay 2 -o "$out" "$url"
+    else
+        wget -q --tries=3 --timeout=60 -O "$out" "$url"
+    fi
+}
+
+_list_dir() {
+    local url="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --max-time 60 --retry 1 "$url/" 2>/dev/null
+    else
+        wget -qO- --tries=2 --timeout=60 "$url/" 2>/dev/null
+    fi
+}
+
+# 归档目录按字母/分页排序，同一包有多份时最后一条未必最新（例如 2.4.42 会排在
+# 2.4.49 之后）。这里按版本号挑最高的一个，并过滤掉来自新系统的 2.5/2.6 包。
+pick_highest() {
+    local pattern="$1"
+    local name
+    if command -v sort >/dev/null 2>&1; then
+        name="$(printf '%s\n' "$_LIST_CACHE" | grep -oE "$pattern" | sort -uV | tail -1)"
+    else
+        name="$(printf '%s\n' "$_LIST_CACHE" | grep -oE "$pattern" | sort -u | tail -1)"
+    fi
+    printf '%s' "$name"
+}
+
+# 目录列表只取一次，避免重复请求被源端限速。
+# 注意 _LIST_CACHE 必须是全局变量，局部变量在函数返回后即失效。
+_LIST_CACHE=""
+_listed_dirs=""
+
+cache_dir_listing() {
+    local base="$1"
+    case "|$_listed_dirs" in
+        *"|$base|"*) return 0 ;;
+    esac
+    _listed_dirs="$_listed_dirs|$base"
+    _LIST_CACHE="$(_list_dir "$base")"
+    # 列表为空（网络不通/被限速）时清掉记录，让上层直接报错而不是走空列表
+    if [ -z "$_LIST_CACHE" ]; then
+        _listed_dirs="${_listed_dirs%%|$base|}"
+        return 1
+    fi
+    return 0
+}
+
+# 优先直连已知文件名，省掉一次目录列表请求。
+# 镜像的 patch 版本可能落后，逐个降级尝试，直到取到一个能用的。
+_fetch_first_ok() {
+    local base="$1" outdir="$2"
+    shift 2
+    local n
+    for n in "$@"; do
+        [ -n "$n" ] || continue
+        if _fetch "$base/$n" "$outdir/$n" && [ -s "$outdir/$n" ]; then
+            printf '%s' "$n"
+            return 0
+        fi
+        rm -f "$outdir/$n"
+    done
+    return 1
+}
+
+# 获取 OpenLDAP 2.4 兼容库：优先本机软件源，其次 Ubuntu 18.04 归档
+fetch_openldap24() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    local got=0
+
+    case "$PKG_FAMILY" in
+        deb)
+            local work="$tmp/src"
+            mkdir -p "$work"
+            # 本机源仍有 libldap-2.4-2 时（Debian 12 等）直接取
+            if ( cd "$work" && "$PKG_MGR" download libldap-2.4-2 >/dev/null 2>&1 ); then
+                local deb
+                for deb in "$work"/libldap-2.4-2_*.deb; do
+                    [ -f "$deb" ] || continue
+                    dpkg-deb -x "$deb" "$tmp/x" && got=1 && break
+                done
+            fi
+            if [ "$got" -eq 0 ]; then
+                # 直连已知文件名，省一次目录请求（镜像的补丁版本可能不同，逐个降级）
+                local name
+                name="$(_fetch_first_ok "$OPENLDAP24_DEB_BASE" "$work" \
+                         libldap-2.4-2_2.4.49+dfsg-2ubuntu1.10_amd64.deb \
+                         libldap-2.4-2_2.4.49+dfsg-2ubuntu1_amd64.deb \
+                         libldap-2.4-2_2.4.45+dfsg-1ubuntu1.11_amd64.deb \
+                         libldap-2.4-2_2.4.45+dfsg-1ubuntu1_amd64.deb)"
+                if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_DEB_BASE"; then
+                    name="$(pick_highest 'libldap-2\.4-2_2\.4\.[^"<>]+amd64\.deb')"
+                    [ -n "$name" ] && _fetch "$OPENLDAP24_DEB_BASE/$name" "$work/$name"
+                fi
+                if [ -n "$name" ] && [ -s "$work/$name" ] \
+                   && dpkg-deb -x "$work/$name" "$tmp/x"; then
+                    got=1
+                fi
+            fi ;;
+        rpm)
+            local name
+            name="$(pick_highest 'openldap-2\.4[^"<>]*x86_64\.rpm' 2>/dev/null)"
+            if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_RPM_BASE"; then
+                name="$(pick_highest 'openldap-2\.4[^"<>]*x86_64\.rpm')"
+            fi
+            if [ -n "$name" ]; then
+                # EPEL 目录按包名分页，直接按名抓取即可
+                _fetch "$OPENLDAP24_RPM_BASE/$name" "$tmp/$name" || _fetch "$(dirname "$OPENLDAP24_RPM_BASE")/$name" "$tmp/$name" || true
+                if [ -f "$tmp/$name" ]; then
+                    mkdir -p "$tmp/x"
+                    ( cd "$tmp/x" && rpm2cpio "$tmp/$name" | cpio -idm --quiet ) && got=1
+                fi
+            fi
+            if [ "$got" -eq 0 ] && command -v dnf >/dev/null 2>&1; then
+                # 兜底：CentOS Stream 8 的 openldap 2.4 客户端库
+                if dnf download --destdir "$tmp" --releasever=8 --repoid=ol8_appstream openldap 2>/dev/null \
+                   || dnf download --destdir "$tmp" --releasever=8 centos-stream-8-baseos-openldap 2>/dev/null; then
+                    local r
+                    for r in "$tmp"/*.rpm; do
+                        [ -f "$r" ] || continue
+                        mkdir -p "$tmp/x"
+                        ( cd "$tmp/x" && rpm2cpio "$r" | cpio -idm --quiet ) && got=1
+                    done
+                fi
+            fi ;;
+    esac
+
+    if [ "$got" -eq 0 ]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    local found=0 f bn
+    # 注意不能用 usr/lib*/xxx 这种通配：* 只跨一层路径，匹配不到
+    # usr/lib/x86_64-linux-gnu/ 这样的深层目录，必须用 find。
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        obj_has_openldap24 "$f" || continue
+        bn="$(basename "$f")"
+        cp -a "$f" "$dest/$bn"
+        case "$bn" in
+            libldap_r-2.4.so.2.*) ln -sf "$bn" "$dest/libldap_r-2.4.so.2" ;;
+            liblber-2.4.so.2.*)   ln -sf "$bn" "$dest/liblber-2.4.so.2" ;;
+        esac
+        found=1
+    done <<EOF
+$(find "$tmp/x" \( -name 'libldap_r-2.4.so.2.*' -o -name 'liblber-2.4.so.2.*' \) -type f 2>/dev/null)
+EOF
+    rm -rf "$tmp"
+    [ "$found" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# 问题 2：OpenSSL 1.0 / libaudio2
+# ---------------------------------------------------------------------------
+# 客户端有 5 个二进制硬依赖 libssl.so.10（OpenSSL 1.0），而 Debian 12+ / Ubuntu 24.04+
+# 已不再提供，Fedora 也只到 1.1。同代 Qt4 还会拉 libaudio.so.2（NAS，新系统已改用
+# pulseaudio）。两者都补进 compat/，用私有 SONAME 遮蔽系统同名库。
+curl_needs_openssl10() {
+    local curl="$LIB_DIR/libcurl.so.4.4.0"
+    [ -f "$curl" ] || curl="$LIB_DIR/libcurl.so.4"
+    [ -f "$curl" ] || return 1
+    objdump -p "$curl" 2>/dev/null | grep -q "OPENSSL_1\.0"
+}
+
+binaries_need_ssl10() {
+    local f
+    for f in "$BIN_DIR"/*; do
+        [ -f "$f" ] || continue
+        is_elf "$f" || continue
+        case "$f" in *.real) ;; esac
+        objdump -p "$f" 2>/dev/null | grep -q "libssl.so.10" && return 0
+    done
+    return 1
+}
+
+ssl10_via_client() {
+    [ -f "$LIB_DIR/libssl.so.10" ] && [ -f "$LIB_DIR/libcrypto.so.10" ]
+}
+
+ssl10_via_compat() {
+    [ -f "$COMPAT_DIR/libssl.so.10" ] && [ -f "$COMPAT_DIR/libcrypto.so.10" ]
+}
+
+system_ssl10_ok() {
+    local f
+    for f in $(ldconfig -p 2>/dev/null | awk '/libssl\.so\.10/ {print $NF}'); do
+        [ -f "$(readlink -f "$f")" ] && return 0
+    done
+    return 1
+}
+
+compat_has_libaudio() {
+    [ -f "$COMPAT_DIR/libaudio.so.2" ]
+}
+
+# 通用：取一个 deb 到指定目录。先试已知文件名，再退回目录列表择优
+_deb_fetch() {
+    local base="$1" outdir="$2" pattern="$3"
+    shift 3
+    local name
+    name="$(_fetch_first_ok "$base" "$outdir" "$@")"
+    if [ -z "$name" ]; then
+        cache_dir_listing "$base" || return 1
+        name="$(pick_highest "$pattern")"
+        [ -n "$name" ] || return 1
+        _fetch "$base/$name" "$outdir/$name" && [ -s "$outdir/$name" ] || return 1
+    fi
+    printf '%s' "$name"
+}
+
+fetch_ssl10() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    _deb_fetch "$OPENSSL10_DEB_BASE" "$tmp" 'libssl1\.0\.0_[^"<>]+amd64\.deb' \
+        libssl1.0.0_1.0.2n-1ubuntu5.13_amd64.deb \
+        libssl1.0.0_1.0.2n-1ubuntu5_amd64.deb >/dev/null || { rm -rf "$tmp"; return 1; }
+    local deb
+    for deb in "$tmp"/libssl1.0.0_*.deb; do
+        [ -f "$deb" ] || continue
+        dpkg-deb -x "$deb" "$tmp/x" || { rm -rf "$tmp"; return 1; }
+        local f bn
+        while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            bn="$(basename "$f")"
+            cp -a "$f" "$dest/$bn"
+            case "$bn" in
+                libssl.so.1.0.0)    ln -sf "$bn" "$dest/libssl.so.10" ;;
+                libcrypto.so.1.0.0) ln -sf "$bn" "$dest/libcrypto.so.10" ;;
+            esac
+        done <<EOF
+$(find "$tmp/x" \( -name 'libssl.so.1.0.0' -o -name 'libcrypto.so.1.0.0' \) -type f 2>/dev/null)
+EOF
+    done
+    rm -rf "$tmp"
+    [ -f "$dest/libssl.so.10" ] && [ -f "$dest/libcrypto.so.10" ]
+}
+
+fetch_libaudio2() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+    _deb_fetch "$LIBAUDIO2_DEB_BASE" "$tmp" 'libaudio2_[^"<>]+amd64\.deb' \
+        libaudio2_1.9.4-6_amd64.deb >/dev/null || { rm -rf "$tmp"; return 1; }
+    local f bn okc=0
+    for f in "$tmp"/libaudio2_*.deb; do
+        [ -f "$f" ] || continue
+        dpkg-deb -x "$f" "$tmp/x" || continue
+        local g
+        while IFS= read -r g; do
+            [ -f "$g" ] || continue
+            bn="$(basename "$g")"
+            cp -a "$g" "$dest/$bn"
+            ln -sf "$bn" "$dest/libaudio.so.2"
+            okc=1
+        done <<EOF
+$(find "$tmp/x" -name 'libaudio.so.2.*' -type f 2>/dev/null)
+EOF
+    done
+    rm -rf "$tmp"
+    [ "$okc" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# 问题 3：super_agent 系统识别
+# ---------------------------------------------------------------------------
+# 客户端执行的是 `cat /etc/os-release | grep -w ID`，只接受这几个值。
+super_agent_accepts_os() {
+    case "$1" in ubuntu|kylin|uos|centos) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# 问题 4：Qt4
+# ---------------------------------------------------------------------------
+qt4_in_prefix() {
+    local p="$1"
+    [ -f "$p/libQtCore.so.4" ] && [ -f "$p/libQtGui.so.4" ]
+}
+
+qt4_system_sonames() {
+    local f
+    for f in $NEED_QT_SONAMES; do
+        ldconfig -p 2>/dev/null | grep -q " $f " || return 1
+    done
+    return 0
+}
+
+# 系统 Qt4 若来自已知有缺陷的重打包版本则判定不可用
+qt4_system_bad() {
+    local f ver
+    for f in $(ldconfig -p 2>/dev/null | awk '/libQtCore\.so\.4/ {print $NF}' | sort -u); do
+        ver="$(run "$PKG_QUERY" -S "$f" 2>/dev/null | head -1)"
+        case "$ver" in *"$KNOWN_BAD_QT_PATTERNS"*) return 0 ;; esac
+    done
+    # 没有包管理器信息时（源码安装等）无从判断，视为可用
+    return 1
+}
+
+# 从 Ubuntu 18.04 归档取官方构建 Qt4（7ubuntu1，已实测可用）
+fetch_qt4() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+
+    local name okc=0
+    for name in libqtcore4_4.8.7+dfsg-7ubuntu1_amd64.deb \
+                libqtgui4_4.8.7+dfsg-7ubuntu1_amd64.deb \
+                libqt4-network_4.8.7+dfsg-7ubuntu1_amd64.deb \
+                libqt4-svg_4.8.7+dfsg-7ubuntu1_amd64.deb; do
+        _fetch "$QT4_DEB_BASE/$name" "$tmp/$name" || continue
+        [ -s "$tmp/$name" ] || continue
+        dpkg-deb -x "$tmp/$name" "$tmp/x" && okc=1
+    done
+    # 上面是直连；若镜像或归档布局变化导致全部失败，退回目录列表择优
+    if [ "$okc" -eq 0 ] && cache_dir_listing "$QT4_DEB_BASE"; then
+        local p
+        for p in libqtcore4 libqtgui4 libqt4-network libqt4-svg; do
+            name="$(pick_highest "${p}_4\.8\.7[^\"<>]*_amd64\.deb")"
+            [ -n "$name" ] || continue
+            _fetch "$QT4_DEB_BASE/$name" "$tmp/$name" || continue
+            dpkg-deb -x "$tmp/$name" "$tmp/x" && okc=1
+        done
+    fi
+    if [ "$okc" -eq 0 ]; then rm -rf "$tmp"; return 1; fi
+
+    local f bn sn
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        bn="$(basename "$f")"
+        sn="${bn%.4.8.7}"
+        cp -a "$f" "$dest/$bn"
+        ln -sf "$bn" "$dest/$sn.4"
+    done <<EOF
+$(find "$tmp/x" -name 'libQt*.so.4.8.7' -type f 2>/dev/null)
+EOF
+    rm -rf "$tmp"
+    qt4_in_prefix "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# 包装脚本
+# ---------------------------------------------------------------------------
+is_elf() { head -c 4 "$1" 2>/dev/null | grep -q $'\x7fELF'; }
+
+# 判断是否为本补丁生成的包装脚本（而不是原生 ELF）
+is_patch_wrapper() {
+    is_elf "$1" && return 1
+    head -1 "$1" 2>/dev/null | grep -q '^#!/bin/bash' || return 1
+    grep -q "sangfor-vdi-linux-patch" "$1" 2>/dev/null && return 0
+    grep -qE 'exec .*/bin/[^/"]+\.real' "$1" 2>/dev/null
+}
+
+write_wrapper() {
+    local bin="$1" real="$1.real" prog
+    prog="$(basename "$bin")"
+    is_elf "$bin" || { dbg "skip non-ELF: $bin"; return 0; }
+    if [ ! -f "$real" ]; then
+        run cp -a "$bin" "$real"
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] write wrapper: $bin"
+        return 0
+    fi
+    local tmpf
+    tmpf="$(mktemp "$BIN_DIR/.wrap.XXXXXX")"
+    # 注意：必须用普通单引号 heredoc。用双引号时 \$ 会被展开成 $，
+    # 生成的脚本会在运行时误取包装脚本自身的环境，导致 LD_LIBRARY_PATH 拼不出兼容目录。
+    cat > "$tmpf" <<'EOF'
+#!/bin/bash
+# 由 sangfor-vdi-linux-patch 生成：加载兼容库后再启动原程序
+SANGFOR="/usr/local/sangfor/vdiclient"
+QT_PREFIX="/usr/local/Trolltech/Qt-4.8.7"
+LD_PATH=""
+for d in "$QT_PREFIX/lib" "$SANGFOR/compat" "$SANGFOR/lib"; do
+    if [ -d "$d" ]; then
+        if [ -n "$LD_PATH" ]; then LD_PATH="$LD_PATH:$d"; else LD_PATH="$d"; fi
+    fi
+done
+if [ -n "$LD_PATH" ]; then
+    if [ -n "$LD_LIBRARY_PATH" ]; then
+        export LD_LIBRARY_PATH="$LD_PATH:$LD_LIBRARY_PATH"
+    else
+        export LD_LIBRARY_PATH="$LD_PATH"
+    fi
+fi
+exec "$SANGFOR/bin/__PROG__.real" "$@"
+EOF
+    # 用 sed 填入程序名，避免 heredoc 里出现双引号变量
+    sed -i "s/__PROG__/$prog/g" "$tmpf"
+    chmod 755 "$tmpf"
+    mv -f "$tmpf" "$bin"
+    chown 0:0 "$bin" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# setuid 程序（vdi_session / rapp_session）
+# ---------------------------------------------------------------------------
+# 打开虚拟桌面时客户端会 fork+exec 这两个程序，它们带 setuid 位。动态链接器对
+# setuid 二进制会强制忽略 LD_LIBRARY_PATH（安全策略），所以包装脚本对它无效，
+# 启动 70ms 内即因 OPENLDAP_2.4_2 not found 退出，客户端报"组件连接超时"。
+#
+# 唯一可靠的办法是让旧库出现在 ld.so 默认搜索路径里。为了把影响面降到最小：
+#   - 单独建 compat/ldso/ 目录，只放 3 个与系统现有 SONAME 不冲突的库
+#     （系统的 OpenLDAP 是 libldap.so.2，不是 libldap_r-2.4.so.2）
+#   - 通过 /etc/ld.so.conf.d 的一个专用文件挂进去，卸载只需删文件 + ldconfig
+LDSO_DIR_NAME="ldso"
+LDSO_WHITELIST="libldap_r-2.4.so.2 liblber-2.4.so.2 libaudio.so.2"
+LDSO_CONF="/etc/ld.so.conf.d/sangfor-vdi-compat.conf"
+
+setuid_binaries() {
+    find "$BIN_DIR" -maxdepth 1 -type f -perm -u+s 2>/dev/null
+}
+
+needs_ldso_whitelist() {
+    local f
+    for f in $(setuid_binaries); do
+        # setuid 程序自身未必直接依赖旧库，可能是经由 libcurl 间接依赖
+        if objdump -p "$f" 2>/dev/null | grep -qE 'libcurl\.so\.4|libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2|libaudio\.so\.2'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+apply_ldso_whitelist() {
+    if ! needs_ldso_whitelist; then
+        ok "没有依赖旧库的 setuid 程序，跳过 ld.so 白名单"
+        return
+    fi
+    local ldir="$COMPAT_DIR/$LDSO_DIR_NAME"
+    run mkdir -p "$ldir"
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        local s src
+        for s in $LDSO_WHITELIST; do
+            src="$(readlink -f "$COMPAT_DIR/$s" 2>/dev/null)"
+            [ -f "$src" ] || continue
+            cp -f "$src" "$ldir/$s"
+            chmod 644 "$ldir/$s"
+        done
+        chown -R 0:0 "$ldir" 2>/dev/null || true
+        cat > "$LDSO_CONF" <<EOF
+# 由 sangfor-vdi-linux-patch 生成
+# 仅为带 setuid 位的 vdi_session / rapp_session 提供旧 ABI 库；
+# 动态链接器对 setuid 程序会忽略 LD_LIBRARY_PATH，只能走默认搜索路径。
+# 这里只放 3 个与系统现有 SONAME 不冲突的库；撤销时删除本文件并执行 ldconfig。
+$ldir
+EOF
+        chmod 644 "$LDSO_CONF"
+        ldconfig
+    else
+        log "[dry-run] 写 $LDSO_CONF 并执行 ldconfig"
+    fi
+    ok "已为 setuid 程序注册 ld.so 白名单（$LDSO_CONF）"
+}
+
+# 检查白名单不会遮蔽系统正在使用的同名库
+ldso_conflicts() {
+    local s out=""
+    for s in $LDSO_WHITELIST; do
+        # 只有“系统本来就提供且正在被使用”的同名库才算冲突；
+        # 系统里那个 libldap_r-2.4.so.2 只是个指向 2.6 的软链桩，不在 ld.so 缓存里，不算冲突。
+        if ldconfig -p 2>/dev/null | grep -q " $s " \
+           && ldconfig -p 2>/dev/null | awk -v n="$s" '$1==n {print $NF}' | grep -qv 'sangfor'; then
+            out="$out $s"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# 撤销时把 *.real 还原成原文件名
+restore_binaries() {
+    local f wrap
+    for f in "$BIN_DIR"/*.real; do
+        [ -f "$f" ] || continue
+        wrap="${f%.real}"
+        # 只要占位文件是脚本而不是 ELF，就说明它由补丁生成（含更早的手工包装），可以安全还原
+        if [ -f "$wrap" ] && ! is_elf "$wrap"; then
+            run rm -f "$wrap"
+        fi
+        if [ ! -f "$wrap" ]; then
+            run mv -f "$f" "$wrap"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# 应用
+# ---------------------------------------------------------------------------
+apply_openldap() {
+    if ! curl_needs_openldap24; then
+        ok "客户端 libcurl 不依赖 OpenLDAP 2.4，跳过"
+        return
+    fi
+    if system_ldap_ok; then
+        ok "系统 OpenLDAP 已是 2.4 且有 $NEED_OPENLDAP_VER"
+        return
+    fi
+    if obj_has_openldap24 "$COMPAT_DIR/libldap_r-2.4.so.2"; then
+        ok "兼容库中已有 OpenLDAP 2.4（$COMPAT_DIR）"
+        return
+    fi
+    info "系统 OpenLDAP 不含 $NEED_OPENLDAP_VER，获取 OpenLDAP 2.4 兼容库..."
+    run mkdir -p "$COMPAT_DIR"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] fetch OpenLDAP 2.4 into $COMPAT_DIR"
+        return
+    fi
+    if fetch_openldap24 "$COMPAT_DIR"; then
+        chown 0:0 "$COMPAT_DIR"/lib*-2.4.so.2* 2>/dev/null || true
+        ok "OpenLDAP 2.4 兼容库已就位"
+    else
+        warn "无法自动获取 OpenLDAP 2.4（网络或镜像不可用）。"
+        warn "请手工把含 $NEED_OPENLDAP_VER 的 libldap_r-2.4.so.2 / liblber-2.4.so.2 放入 $COMPAT_DIR/"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+apply_openssl() {
+    if ! binaries_need_ssl10 && ! curl_needs_openssl10; then
+        ok "客户端不依赖 OpenSSL 1.0，跳过"
+        return
+    fi
+    if ssl10_via_client; then
+        ok "客户端自带 OpenSSL 1.0（libssl.so.10，实为 1.0.2k）"
+        return
+    fi
+    if ssl10_via_compat; then
+        ok "兼容库中已有 OpenSSL 1.0（$COMPAT_DIR）"
+        return
+    fi
+    if system_ssl10_ok; then
+        ok "系统提供 OpenSSL 1.0（libssl.so.10）"
+        return
+    fi
+
+    info "系统没有 OpenSSL 1.0，获取兼容库..."
+    run mkdir -p "$COMPAT_DIR"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] fetch OpenSSL 1.0 into $COMPAT_DIR"
+        return
+    fi
+    if fetch_ssl10 "$COMPAT_DIR"; then
+        chown 0:0 "$COMPAT_DIR"/libssl.so.10* "$COMPAT_DIR"/libcrypto.so.10* 2>/dev/null || true
+        ok "OpenSSL 1.0 兼容库已就位"
+    else
+        warn "无法自动获取 OpenSSL 1.0。请从 Ubuntu 18.04 的 libssl1.0.0 包取出"
+        warn "libssl.so.1.0.0 / libcrypto.so.1.0.0 放入 $COMPAT_DIR/，并建立 libssl.so.10 软链。"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+apply_os_release() {
+    local svc=""
+    local cand
+    for cand in /usr/lib/systemd/system/vdi_super_agent.service /lib/systemd/system/vdi_super_agent.service; do
+        [ -f "$cand" ] && { svc="$cand"; break; }
+    done
+    if super_agent_accepts_os "$OS_ID"; then
+        ok "系统 ID=$OS_ID 已被 super_agent 识别，跳过"
+        return
+    fi
+    if [ -z "$svc" ]; then
+        warn "系统 ID=$OS_ID 不被识别，但未找到 vdi_super_agent.service"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    run mkdir -p "$COMPAT_DIR" "$SYSTEMD_DROPIN"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 生成 $COMPAT_DIR/os-release 与 $SYSTEMD_DROPIN/compat-os-release.conf"
+        return
+    fi
+    local src="/etc/os-release"
+    [ -r "$src" ] || src="/usr/lib/os-release"
+    cp -f "$src" "$COMPAT_DIR/os-release"
+    # 只改 super_agent 读的那几个字段，其余保持原样便于排查
+    sed -i -e "s/^ID=.*/ID=ubuntu/" \
+           -e "s/^NAME=.*/NAME=\"Ubuntu\"/" \
+           -e "s/^PRETTY_NAME=.*/PRETTY_NAME=\"Ubuntu 24.04 LTS\"/" \
+           "$COMPAT_DIR/os-release"
+    chmod 644 "$COMPAT_DIR/os-release"; chown 0:0 "$COMPAT_DIR/os-release" 2>/dev/null || true
+    cat > "$SYSTEMD_DROPIN/compat-os-release.conf" <<EOF
+[Service]
+# 由 sangfor-vdi-linux-patch 生成
+# super_agent 只识别 ubuntu/kylin/uos/centos；用 bind 挂载的方式
+# 仅为该服务提供一份 ID=ubuntu 的 os-release，不影响系统其余部分。
+BindReadOnlyPaths=$COMPAT_DIR/os-release:/etc/os-release
+EOF
+    chmod 644 "$SYSTEMD_DROPIN/compat-os-release.conf"
+    ok "已为 vdi_super_agent 单独挂载 ubuntu 版 os-release"
+}
+
+apply_qt() {
+    [ "$OPT_SKIP_QT" -eq 1 ] && { info "按要求跳过 Qt4 处理"; return; }
+
+    if [ "$OPT_FORCE_QT" -eq 0 ] && qt4_in_prefix "$EXPECTED_QT_PREFIX/lib"; then
+        ok "已内置 Qt4 运行时（$EXPECTED_QT_PREFIX/lib）"
+    elif [ "$OPT_FORCE_QT" -eq 0 ] && qt4_system_sonames; then
+        if qt4_system_bad; then
+            warn "系统 Qt4 命中已知缺陷版本（$KNOWN_BAD_QT_PATTERNS），改用内置 Qt4"
+        else
+            ok "系统 Qt4 可用（不是已知缺陷版本）"
+            return
+        fi
+    else
+        info "安装 Qt4 运行时到 $EXPECTED_QT_PREFIX/lib"
+        run mkdir -p "$EXPECTED_QT_PREFIX/lib"
+        if [ "$OPT_DRY_RUN" -eq 1 ]; then
+            log "[dry-run] fetch Qt4 into $EXPECTED_QT_PREFIX/lib"
+            return
+        fi
+        if fetch_qt4 "$EXPECTED_QT_PREFIX/lib"; then
+            chown -R 0:0 "$EXPECTED_QT_PREFIX" 2>/dev/null || true
+            chmod 755 "$EXPECTED_QT_PREFIX" "$EXPECTED_QT_PREFIX/lib" 2>/dev/null || true
+            ok "Qt4 运行时已就位（$EXPECTED_QT_PREFIX/lib）"
+        else
+            rm -rf "$EXPECTED_QT_PREFIX"
+            warn "无法自动获取 Qt4。可从 Ubuntu 18.04 的 libqtcore4 / libqtgui4 / libqt4-network"
+            warn "中取 libQt*.so.4.8.7 放入 $EXPECTED_QT_PREFIX/lib/"
+            FAILED=$((FAILED + 1))
+        fi
+    fi
+
+    # Qt4 的 NAS 音频后端依赖 libaudio.so.2，新发行版已移除
+    if compat_has_libaudio; then
+        ok "libaudio2 兼容库已就位"
+    else
+        info "获取 libaudio2（Qt4 的 libaudio.so.2 依赖，新系统已移除）..."
+        if [ "$OPT_DRY_RUN" -eq 0 ] && fetch_libaudio2 "$COMPAT_DIR"; then
+            ok "libaudio2 已就位"
+        elif [ "$OPT_DRY_RUN" -eq 0 ]; then
+            warn "无法获取 libaudio2；若 Qt4 启动时报 libaudio.so.2 缺失，请手工放入 $COMPAT_DIR/"
+        fi
+    fi
+}
+
+apply_wrappers() {
+    local f count=0
+    # 先把已包装的原件安全还原，保证重跑时一定拿到原生 ELF 再重新包装
+    for f in "$BIN_DIR"/*.real; do
+        [ -f "$f" ] || continue
+        local wrap="${f%.real}"
+        if [ -f "$wrap" ] && is_patch_wrapper "$wrap"; then
+            run rm -f "$wrap"
+        fi
+        run mv -f "$f" "$wrap"
+    done
+    for f in "$BIN_DIR"/*; do
+        [ -f "$f" ] || continue
+        case "$f" in
+            *.real|*.sh|*.c|*.o|*.log|*.txt) continue ;;
+        esac
+        is_elf "$f" || continue
+        write_wrapper "$f"
+        count=$((count + 1))
+    done
+    ok "已包装 $count 个可执行文件"
+}
+
+do_apply() {
+    detect_platform
+    need_root
+    FAILED=0
+    log "sangfor-vdi-linux-patch $PATCH_VERSION"
+    log "系统: $OS_NAME ${OS_VER} (${OS_ID:-?})  包管理: ${PKG_FAMILY:-未知}/${PKG_MGR:-无}"
+    [ -d "$CLIENT_DIR" ] || die "未找到客户端目录 $CLIENT_DIR，请先安装 VDI 客户端"
+
+    apply_openldap
+    apply_openssl
+    apply_os_release
+    apply_qt
+    apply_wrappers
+    # setuid 程序依赖 compat 里的库时，必须先有这些库再注册 ld.so 白名单
+    apply_ldso_whitelist
+
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        touch "$CLIENT_DIR/$MARKER" 2>/dev/null || true
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl try-restart vdi_super_agent.service >/dev/null 2>&1 || true
+        fi
+    fi
+
+    log ""
+    if [ "$FAILED" -eq 0 ]; then
+        ok "补丁应用完成。现在从应用菜单点 VDI 即可（或执行 $BIN_DIR/vdi_local_client）"
+    else
+        warn "有 $FAILED 项需要手工处理，详见上面的提示"
+    fi
+    return "$FAILED"
+}
+
+# ---------------------------------------------------------------------------
+# 验证
+# ---------------------------------------------------------------------------
+ldpath_for_check() {
+    local p="$LIB_DIR"
+    [ -d "$COMPAT_DIR" ] && p="$COMPAT_DIR:$p"
+    [ -d "$EXPECTED_QT_PREFIX/lib" ] && p="$EXPECTED_QT_PREFIX/lib:$p"
+    printf '%s' "$p"
+}
+
+do_verify() {
+    detect_platform
+    info "检查 VDI 客户端运行环境"
+    [ -d "$CLIENT_DIR" ] || die "未找到 $CLIENT_DIR"
+    local rc=0
+    local target="$BIN_DIR/vdi_local_client.real"
+    [ -f "$target" ] || target="$BIN_DIR/vdi_local_client"
+    [ -f "$target" ] || { err "找不到 vdi_local_client"; return 1; }
+
+    local lp out
+    lp="$(ldpath_for_check)"
+    out="$(LD_LIBRARY_PATH="$lp" ldd "$target" 2>&1)"
+    local missing
+    missing="$(printf '%s\n' "$out" | grep -E 'not found' || true)"
+    if [ -z "$missing" ]; then
+        ok "动态链接检查通过（无 not found）"
+    else
+        err "以下依赖缺失:"
+        printf '%s\n' "$missing" | sed 's/^/    /' >&2
+        rc=1
+    fi
+
+    local nwarn
+    nwarn="$(printf '%s\n' "$out" | grep -c 'no version information' || true)"
+    [ "${nwarn:-0}" -gt 0 ] && info "OpenSSL 1.0 无版本表警告 $nwarn 行（无害，可忽略）"
+
+    if printf '%s\n' "$out" | grep -q 'legacy\|compat'; then
+        dbg "已使用兼容库"
+    fi
+
+    if super_agent_accepts_os "$OS_ID"; then
+        ok "系统 ID=$OS_ID 原生被识别"
+    elif [ -f "$SYSTEMD_DROPIN/compat-os-release.conf" ]; then
+        ok "已安装 os-release 兼容（仅对 vdi_super_agent 生效）"
+    else
+        warn "系统 ID=$OS_ID 不被识别且未安装兼容挂载"
+        rc=1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet vdi_super_agent.service 2>/dev/null; then
+            ok "vdi_super_agent 运行中"
+        else
+            info "vdi_super_agent 当前未运行（登录时会由 vdi_update 拉起）"
+        fi
+    fi
+
+    local real_count
+    real_count="$(find "$BIN_DIR" -maxdepth 1 -name '*.real' 2>/dev/null | wc -l)"
+    # 包装脚本若由旧版（或手工）生成，可能指向已不存在的兼容目录，这里一并检查
+    local stale=0 f
+    for f in "$BIN_DIR"/*; do
+        [ -f "$f" ] || continue
+        head -1 "$f" 2>/dev/null | grep -q '^#!/bin/bash' || continue
+        if grep -qE '\$SANGFOR/(legacy-qt|legacy-lib)' "$f" 2>/dev/null; then
+            stale=$((stale + 1))
+        fi
+    done
+    if [ "$stale" -gt 0 ]; then
+        warn "$stale 个包装脚本引用旧路径（legacy-qt/legacy-lib），重跑 apply 可刷新"
+        rc=1
+    fi
+    if [ "$real_count" -gt 0 ]; then
+        ok "已包装 $real_count 个可执行文件"
+    else
+        warn "未发现包装脚本，补丁可能未应用"
+    fi
+
+    # setuid 程序：LD_LIBRARY_PATH 对它无效，必须走 ld.so 默认路径
+    local su
+    su="$(setuid_binaries | wc -l)"
+    if [ "$su" -gt 0 ]; then
+        if [ -f "$LDSO_CONF" ]; then
+            ok "setuid 程序（$su 个）已通过 ld.so 白名单获得兼容库"
+        else
+            warn "检测到 $su 个 setuid 程序但缺少 $LDSO_CONF，打开桌面会失败（组件连接超时）"
+            rc=1
+        fi
+        # 白名单不应遮蔽系统同名库
+        local cf
+        cf="$(ldso_conflicts)"
+        if [ -n "$cf" ]; then
+            warn "ld.so 中同名的系统库会被遮蔽:$cf"
+            rc=1
+        fi
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# 撤销
+# ---------------------------------------------------------------------------
+do_revert() {
+    detect_platform
+    need_root
+    [ -d "$CLIENT_DIR" ] || die "未找到 $CLIENT_DIR"
+    log "将撤销以下改动："
+    log "  - 还原 $BIN_DIR 下的包装脚本"
+    log "  - 删除 $COMPAT_DIR、$SYSTEMD_DROPIN"
+    log "  - 删除 $LDSO_CONF 并执行 ldconfig（撤销 setuid 程序的库路径）"
+    [ -d "$EXPECTED_QT_PREFIX" ] && log "  - 删除 $EXPECTED_QT_PREFIX（由补丁安装的 Qt4）"
+    log "  系统软件包不会被改动。"
+    confirm "确认撤销？" || exit 0
+
+    restore_binaries
+    run rm -f "$LDSO_CONF"
+    run rm -rf "$COMPAT_DIR" "$SYSTEMD_DROPIN" "$CLIENT_DIR/$MARKER"
+    # 移除兼容路径后必须刷新缓存，否则 ld.so 仍指向已删除的目录
+    if [ "$OPT_DRY_RUN" -eq 0 ] && command -v ldconfig >/dev/null 2>&1; then
+        ldconfig 2>/dev/null || true
+    fi
+    if qt4_in_prefix "$EXPECTED_QT_PREFIX/lib"; then
+        run rm -rf "$EXPECTED_QT_PREFIX"
+    fi
+    # 清理补丁创建的父目录（只在为空时删除，避免动到其他程序）
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        local d
+        for d in "$(dirname "$EXPECTED_QT_PREFIX")" "/usr/local/sangfor"; do
+            [ -d "$d" ] && rmdir "$d" 2>/dev/null || true
+        done
+    fi
+    if [ "$OPT_DRY_RUN" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl try-restart vdi_super_agent.service >/dev/null 2>&1 || true
+    fi
+    ok "补丁已撤销"
+}
+
+# ---------------------------------------------------------------------------
+# 诊断
+# ---------------------------------------------------------------------------
+do_diagnose() {
+    detect_platform
+    log "=== 环境 ==="
+    log "系统:     $OS_NAME ${OS_VER}  (ID=$OS_ID, $ARCH)"
+    log "包管理:   ${PKG_FAMILY:-未知} / ${PKG_MGR:-无}"
+    log "客户端:   $CLIENT_DIR $([ -d "$CLIENT_DIR" ] && echo 存在 || echo 未安装)"
+    log ""
+    log "=== 1. OpenLDAP 2.4 ==="
+    if curl_needs_openldap24; then
+        log "libcurl 需要 $NEED_OPENLDAP_VER"
+        if system_ldap_ok; then log "  系统库:   满足"
+        else log "  系统库:   不满足"
+             local f; for f in $(ldconfig -p 2>/dev/null | awk '/libldap_r-2\.4\.so\.2/ {print $NF}'); do
+                 log "    实际 $(readlink -f "$f") => $(objdump -p "$(readlink -f "$f")" 2>/dev/null | grep -oE 'OPENLDAP_[0-9._]+' | sort -u | tr '\n' ' ')"
+             done
+        fi
+        obj_has_openldap24 "$COMPAT_DIR/libldap_r-2.4.so.2" \
+            && log "  兼容库:   满足（$COMPAT_DIR）" || log "  兼容库:   缺失"
+    else
+        log "libcurl 不依赖 OpenLDAP 2.4（跳过）"
+    fi
+    log ""
+    log "=== 2. OpenSSL 1.0 / libaudio2 ==="
+    if binaries_need_ssl10 || curl_needs_openssl10; then
+        ssl10_via_client && log "libssl.so.10:  客户端自带（$LIB_DIR）" \
+            || { ssl10_via_compat && log "libssl.so.10:  兼容库（$COMPAT_DIR）" \
+                 || { system_ssl10_ok && log "libssl.so.10:  系统提供" \
+                      || log "libssl.so.10:  缺失，需要补 $(fetch_hint ssl)"; }; }
+    else
+        log "libssl.so.10:  不需要"
+    fi
+    compat_has_libaudio && log "libaudio.so.2: 兼容库已就位" || log "libaudio.so.2: 兼容库缺失（Qt4 需要）"
+    log ""
+    log "=== 3. 系统识别 ==="
+    log "系统 ID:   $OS_ID"
+    super_agent_accepts_os "$OS_ID" && log "super_agent: 原生识别" || log "super_agent: 不识别，需要 os-release 兼容"
+    [ -f "$SYSTEMD_DROPIN/compat-os-release.conf" ] \
+        && log "兼容挂载:  已安装" || log "兼容挂载:  未安装"
+    log ""
+    log "=== 4. Qt4 ==="
+    if qt4_in_prefix "$EXPECTED_QT_PREFIX/lib"; then
+        log "内置 Qt4:  已有（$EXPECTED_QT_PREFIX/lib）"
+    else
+        log "内置 Qt4:  缺失"
+    fi
+    if qt4_system_sonames; then
+        local ver
+        ver="$(run "$PKG_QUERY" -S "$(ldconfig -p | awk '/libQtCore\.so\.4/ {print $NF; exit}')" 2>/dev/null | head -1)"
+        log "系统 Qt4:  存在 ${ver:+（$ver）}"
+        qt4_system_bad && log "            命中已知缺陷版本，不可用"
+    else
+        log "系统 Qt4:  缺失"
+    fi
+    log ""
+    log "=== 5. 包装状态 ==="
+    log "已包装:    $(find "$BIN_DIR" -maxdepth 1 -name '*.real' 2>/dev/null | wc -l) 个可执行文件"
+    local su_list
+    su_list="$(setuid_binaries | xargs -r -n1 basename 2>/dev/null | tr '\n' ' ')"
+    if [ -n "$su_list" ]; then
+        log "setuid:    $su_list"
+        if [ -f "$LDSO_CONF" ]; then
+            log "ld.so:     已注册 $LDSO_CONF"
+        else
+            log "ld.so:     未注册（这些程序会忽略 LD_LIBRARY_PATH，打开桌面将失败）"
+        fi
+    fi
+    log ""
+    log "=== 6. 链接检查 ==="
+    local t="$BIN_DIR/vdi_local_client.real"
+    [ -f "$t" ] || t="$BIN_DIR/vdi_local_client"
+    if [ -f "$t" ]; then
+        LD_LIBRARY_PATH="$(ldpath_for_check)" ldd "$t" 2>&1 \
+            | grep -E 'not found|ldap|lber|QtCore|QtGui' | sed 's/^/  /'
+    fi
+}
+
+usage() {
+    cat <<EOF
+sangfor-vdi-linux-patch $PATCH_VERSION
+
+让深信服 VDI Linux 客户端跑在新发行版上（Ubuntu 24.04+ / Debian 12+ / Fedora 40+ /
+Linux Mint 等）。处理 OpenLDAP 2.4、OpenSSL 1.0、系统识别、Qt4 四类兼容问题。
+
+用法: $(basename "$0") <命令> [选项]
+
+命令:
+  diagnose   查看环境与各项依赖状态（只读）
+  apply      应用补丁（缺少的兼容库会自动下载）
+  verify     验证补丁结果
+  revert     撤销补丁，恢复原状
+
+选项:
+  -y, --yes        不再询问
+  --dry-run        只打印将执行的操作
+  --force-qt       即使系统 Qt4 可用也换成内置 Qt4
+  --skip-qt        不处理 Qt4
+  -v, --verbose    输出调试信息
+  -h, --help       显示帮助
+
+可通过环境变量覆盖下载源（内网镜像）:
+  BIONIC_BASE           统一下载根（默认 Ubuntu 18.04 归档）
+  OPENLDAP24_DEB_BASE   OpenLDAP 2.4 兼容库来源
+  OPENSSL10_DEB_BASE    OpenSSL 1.0 兼容库来源
+  QT4_DEB_BASE          Qt4 运行时来源
+  LIBAUDIO2_DEB_BASE    libaudio2（Qt4 依赖）来源
+
+示例:
+  sudo ./sangfor-vdi-linux-patch diagnose
+  sudo ./sangfor-vdi-linux-patch apply -y
+  sudo ./sangfor-vdi-linux-patch verify
+EOF
+}
+
+main() {
+    local cmd=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            diagnose|apply|verify|revert) [ -z "$cmd" ] && cmd="$1" ;;
+            -y|--yes) OPT_ASSUME_YES=1 ;;
+            --dry-run) OPT_DRY_RUN=1 ;;
+            --force-qt) OPT_FORCE_QT=1 ;;
+            --skip-qt) OPT_SKIP_QT=1 ;;
+            -v|--verbose) OPT_VERBOSE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) err "未知参数: $1"; usage; exit 2 ;;
+        esac
+        shift
+    done
+    [ -z "$cmd" ] && { usage; exit 2; }
+    case "$cmd" in
+        diagnose) do_diagnose ;;
+        apply)    do_apply ;;
+        verify)   do_verify ;;
+        revert)   do_revert ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,11 @@
+# 本地调试产物，不要提交
+*.log
+*.deb
+*.rpm
+*.tar.gz
+*.tmp
+compat/
+legacy*
+.DS_Store
+test/
+tests/
