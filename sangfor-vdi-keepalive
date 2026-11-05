@@ -183,6 +183,12 @@ do_apply() {
     build_shim
     inject_block
 
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log ""
+        log "[dry-run] 上面是将执行的动作，未改动任何文件"
+        return 0
+    fi
+
     log ""
     ok "保活已启用（只作用于 vdi_client）"
     info "需要重启客户端才生效：退出 VDI 客户端，再从应用菜单重新打开。"
