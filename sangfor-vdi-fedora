@@ -1192,6 +1192,15 @@ find_client_deb() {
     return 1
 }
 
+# Fedora 内核的 USB/IP 模块名是 usbip_core，与客户端内置的 usbip 模块不匹配，
+# vdi_usbipd 会反复重启直到 start-limit-hit。桌面连接不依赖它，停掉避免刷日志。
+disable_usbipd() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl is-enabled --quiet vdi_usbipd.service 2>/dev/null || return 0
+    run systemctl disable --now vdi_usbipd.service >/dev/null 2>&1 || true
+    ok "已停用 vdi_usbipd（Fedora 上 USB 重定向不可用，该服务会无限重启）"
+}
+
 # postinst 会拉起"安装依赖"进度窗并留下标记；新发行版上 install_depend.sh 永远
 # 不会完成，客户端读到此标记就认为依赖不完整（CHECK_VER 返回 false 并拒绝登录）。
 post_install_cleanup() {
@@ -1209,6 +1218,7 @@ post_install_cleanup() {
         is_elf "$wrap" && rm -f "$f"
     done
     clear_depend_flag
+    disable_usbipd
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl try-restart vdi_super_agent.service >/dev/null 2>&1 || true
@@ -1231,6 +1241,8 @@ install_client_from_deb() {
     [ -f "$tmp/ctrl/postinst" ] || { rm -rf "$tmp"; die "deb 里没有 postinst，包不完整"; }
     # 数据段只包含 /opt/apps 与 /usr/share/{applications,icons}，不会覆盖系统文件
     dpkg-deb -x "$deb" / || { rm -rf "$tmp"; die "解包客户端文件失败"; }
+    # postinst 开头就写这个日志文件，但它自己建目录的步骤在更后面，先建好省掉三条报错
+    mkdir -p /var/log/sangfor/vdiclient 2>/dev/null || true
     info "执行 postinst configure（落盘、建 systemd 单元、装图标）..."
     ( cd "$tmp/ctrl" && bash ./postinst configure "" ) || warn "postinst 返回非 0，继续检查结果"
     rm -rf "$tmp"
@@ -1283,6 +1295,7 @@ do_apply() {
     # 正常由 install_depend.sh 完成后删除；该脚本不认新发行版，标记会一直留着，
     # 客户端据此判定"依赖未安装完整"，CHECK_VER 返回 false 并拒绝登录。
     clear_depend_flag
+    disable_usbipd
 
     if [ "$OPT_DRY_RUN" -eq 0 ]; then
         touch "$CLIENT_DIR/$MARKER" 2>/dev/null || true

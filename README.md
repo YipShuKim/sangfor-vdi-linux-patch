@@ -244,6 +244,12 @@ sudo systemctl disable --now vdi_usbipd
 2. **`/etc/sangfor/vdiclient/is_installing_depend` 残留**。见上表，`sangfor-vdi-fedora`
    在依赖齐备后会自动清除。
 
+**安装日志里 `vdi_session_conf: 是一个目录` 要紧吗？**
+不要紧，是厂商自己的 bug：`postinst` 一处把 `/etc/sangfor/vdiclient/vdi_session_conf` 当目录
+创建，另一处又把它当文件写入 `DISPLAY=...`，所以那句报错每次安装都会出现。DISPLAY 的实际
+取值由启动包装脚本兜底，不影响登录。同理，`postinst` 开头三行 `vdi-install.log: 没有那个文件`
+也只是它先写日志、后建目录的顺序问题，本补丁会预先建好目录。
+
 **点开桌面后界面退回资源列表、进不去桌面？**
 日志里若出现 `Session start process was canceled!`，通常是 **`vdi_tray` 先死掉**导致的连锁
 反应。查日志中是否有 `cannot connect to X server <本机IP>`，那是 `DISPLAY` 被算成了 TCP 形式，
