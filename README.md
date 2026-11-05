@@ -212,6 +212,19 @@ sudo systemctl disable --now vdi_usbipd
    日志出现 `client update! quit client and wait to start`，登录界面随即退出。
    补丁在依赖齐备后会自动清除它。
 
+**点开桌面后界面退回资源列表、进不去桌面？**
+日志里若出现 `Session start process was canceled!`，通常是 **`vdi_tray` 先死掉**导致的连锁反应。
+查 `/tmp` 或直接手工跑一次 `vdi_tray`，若报
+`cannot connect to X server <本机IP>`，则是 `DISPLAY` 被算成了 TCP 形式
+（`<ip>:0`），而 GNOME 的 XWayland 只监听 unix socket。
+
+补丁的包装脚本已处理：存在 `/tmp/.X11-unix/X0` 时把 IP 形式的 `DISPLAY` 改写为 `:0`，
+并在 `XAUTHORITY` 缺失/不可读时自动补 `/run/user/<uid>/.mutter-Xwaylandauth.*`。
+
+另外 `vdi_tray` 是 Qt4 的 `QSystemTrayIcon`，需要 XEmbed 系统托盘。GNOME 没有系统托盘，
+必要时可装一个托盘宿主（如 Fedora 的 `stalonetray`）：
+`stalonetray --geometry 1x1+0+0 &`
+
 **GNOME 的"全部应用"里找不到客户端？**
 客户端自带的 `.desktop` 有两个问题：末尾**没有换行符**，且 `Categories=Application;Development;`
 会让 GNOME 45+ 把它收进「开发」文件夹而不是顶层。重写为规范格式即可：
