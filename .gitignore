@@ -6,6 +6,7 @@
 *.tmp
 compat/
 legacy*
+*.so
 .DS_Store
 test/
 tests/

@@ -61,10 +61,17 @@ LIBAUDIO2_DEB_BASE="${LIBAUDIO2_DEB_BASE:-$BIONIC_BASE/main/n/nas}"
 # 可选行为
 OPT_FORCE_QT=0
 OPT_SKIP_QT=0
+OPT_NO_IDLE_LOGOUT=0
 OPT_ROOT=""
 OPT_ASSUME_YES=0
 OPT_DRY_RUN=0
 OPT_VERBOSE=0
+
+# 可选功能：关闭客户端 20 分钟空闲自动登出（详见 shim/noinput_timeout.c）
+SHIM_SRC_NAME="noinput_timeout.c"
+SHIM_LIB_NAME="libnoinput_timeout.so"
+SHIM_EXPECTED_VERSION="5.9.6.2154"
+SHIM_TESTED_OFFSET="0xd2ca8"
 
 # ---------------------------------------------------------------------------
 # 输出
@@ -540,6 +547,84 @@ is_patch_wrapper() {
     grep -qE 'exec .*/bin/[^/"]+\.real' "$1" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# 可选功能：关闭 20 分钟空闲自动登出
+# ---------------------------------------------------------------------------
+# vdi_client 读服务端下发的 NoInputTimeout，值 > 0 就进入固定计时循环，到期
+# 主动 logout。该计时器不响应真实输入，远程桌面下必然误踢（详见 shim 源码注释）。
+# 这里编译一个小 shim，只把"解析 NoInputTimeout 的那次 atoi"归零。
+shim_applies_to() {
+    [ "$1" = "vdi_client" ]
+}
+
+# 客户端版本（委托给已安装包，取不到就跳过校验，仅告警）
+client_version() {
+    local f="$CLIENT_DIR/version"
+    [ -f "$f" ] && { head -c 64 "$f" | tr -dc '0-9.' ; return; }
+    if [ "$PKG_FAMILY" = "deb" ] && command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Version}' com.sangfor.vdi 2>/dev/null
+    fi
+}
+
+shim_source_dir() {
+    local d
+    for d in "$(dirname "$(readlink -f "$0")")/shim" "./shim"; do
+        [ -f "$d/$SHIM_SRC_NAME" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+apply_idle_logout_shim() {
+    if [ "$OPT_NO_IDLE_LOGOUT" -ne 1 ]; then
+        # 未启用：清掉之前可能部署过的 shim，避免残留继续生效
+        if [ -f "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME" ]; then
+            run rm -f "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME"
+            ok "未启用 --disable-idle-logout，已移除既有 shim"
+            IDLE_SHIM_ACTIVE=0
+        fi
+        return 0
+    fi
+
+    local ver
+    ver="$(client_version)"
+    if [ -n "$ver" ] && [ "$ver" != "$SHIM_EXPECTED_VERSION" ]; then
+        warn "客户端版本为 $ver，而 shim 仅在 $SHIM_EXPECTED_VERSION 上验证过调用点偏移。"
+        warn "继续部署：若偏移不符，shim 不会命中，客户端行为回到原厂默认（不会更糟）。"
+    fi
+
+    local src
+    if ! src="$(shim_source_dir)"; then
+        warn "找不到 shim 源码 $SHIM_SRC_NAME（应与主脚本同级 shim/ 目录）"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+
+    local ccb
+    ccb="$(command -v cc || command -v gcc || true)"
+    if [ -z "$ccb" ]; then
+        warn "未找到 C 编译器，无法构建 shim。请安装 gcc/cc 后重跑 apply。"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+
+    run mkdir -p "$CLIENT_DIR/compat/shim"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 编译 $SHIM_LIB_NAME 到 $CLIENT_DIR/compat/shim/"
+        return
+    fi
+    if ! "$ccb" -shared -fPIC -O2 -Wall -o "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME" \
+         "$src/$SHIM_SRC_NAME" -ldl 2>"$CLIENT_DIR/compat/shim/.build.log"; then
+        warn "shim 编译失败：$(tail -1 "$CLIENT_DIR/compat/shim/.build.log" 2>/dev/null)"
+        FAILED=$((FAILED + 1))
+        return
+    fi
+    rm -f "$CLIENT_DIR/compat/shim/.build.log"
+    chown 0:0 "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME" 2>/dev/null || true
+    chmod 644 "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME"
+    IDLE_SHIM_ACTIVE=1
+    ok "已启用：关闭 20 分钟空闲自动登出（仅作用于 vdi_client）"
+}
+
 write_wrapper() {
     local bin="$1" real="$1.real" prog
     prog="$(basename "$bin")"
@@ -575,6 +660,27 @@ if [ -n "$LD_PATH" ]; then
 fi
 exec "$SANGFOR/bin/__PROG__.real" "$@"
 EOF
+    # 可选功能 shim：只对 vdi_client 生效，且在库存在时才注入
+    if [ "$OPT_NO_IDLE_LOGOUT" -eq 1 ] && shim_applies_to "$prog"; then
+        local shim_block
+        shim_block=$(cat <<'EOF'
+SHIM="$SANGFOR/compat/shim/__SHIMLIB__"
+if [ -f "$SHIM" ]; then
+    if [ -n "$LD_PRELOAD" ]; then
+        export LD_PRELOAD="$SHIM:$LD_PRELOAD"
+    else
+        export LD_PRELOAD="$SHIM"
+    fi
+fi
+EOF
+)
+        # 在 exec 行之前插入 shim 段
+        awk -v block="$shim_block" '
+            /^exec "\$SANGFOR\/bin\// && !done { print block; done=1 }
+            { print }
+        ' "$tmpf" > "$tmpf.new" && mv -f "$tmpf.new" "$tmpf"
+        sed -i "s/__SHIMLIB__/$SHIM_LIB_NAME/" "$tmpf"
+    fi
     # 用 sed 填入程序名，避免 heredoc 里出现双引号变量
     sed -i "s/__PROG__/$prog/g" "$tmpf"
     chmod 755 "$tmpf"
@@ -858,6 +964,8 @@ do_apply() {
     apply_openssl
     apply_os_release
     apply_qt
+    # 可选功能要先准备好 shim，包装脚本才会按需注入
+    apply_idle_logout_shim
     apply_wrappers
     # setuid 程序依赖 compat 里的库时，必须先有这些库再注册 ld.so 白名单
     apply_ldso_whitelist
@@ -975,6 +1083,17 @@ do_verify() {
             rc=1
         fi
     fi
+
+    # 可选功能：空闲登出 shim
+    if [ -f "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME" ]; then
+        local vc="$BIN_DIR/vdi_client"
+        if [ -f "$vc" ] && grep -q "$SHIM_LIB_NAME" "$vc" 2>/dev/null; then
+            ok "已启用：关闭 20 分钟空闲自动登出（vdi_client 已注入 shim）"
+        else
+            warn "shim 库存在但 vdi_client 包装未注入，重跑 apply 可修复"
+            rc=1
+        fi
+    fi
     return "$rc"
 }
 
@@ -988,6 +1107,7 @@ do_revert() {
     log "将撤销以下改动："
     log "  - 还原 $BIN_DIR 下的包装脚本"
     log "  - 删除 $COMPAT_DIR、$SYSTEMD_DROPIN"
+    [ -f "$CLIENT_DIR/compat/shim/$SHIM_LIB_NAME" ] && log "  - 删除空闲登出 shim（compat/shim/）"
     log "  - 删除 $LDSO_CONF 并执行 ldconfig（撤销 setuid 程序的库路径）"
     [ -d "$EXPECTED_QT_PREFIX" ] && log "  - 删除 $EXPECTED_QT_PREFIX（由补丁安装的 Qt4）"
     log "  系统软件包不会被改动。"
@@ -1101,7 +1221,7 @@ usage() {
 sangfor-vdi-linux-patch $PATCH_VERSION
 
 让深信服 VDI Linux 客户端跑在新发行版上（Ubuntu 24.04+ / Debian 12+ / Fedora 40+ /
-Linux Mint 等）。处理 OpenLDAP 2.4、OpenSSL 1.0、系统识别、Qt4 四类兼容问题。
+Linux Mint 等）。处理 OpenLDAP 2.4、OpenSSL 1.0、系统识别、Qt4、setuid 五类兼容问题。
 
 用法: $(basename "$0") <命令> [选项]
 
@@ -1116,6 +1236,8 @@ Linux Mint 等）。处理 OpenLDAP 2.4、OpenSSL 1.0、系统识别、Qt4 四�
   --dry-run        只打印将执行的操作
   --force-qt       即使系统 Qt4 可用也换成内置 Qt4
   --skip-qt        不处理 Qt4
+  --disable-idle-logout
+                   关闭客户端 20 分钟空闲自动登出（默认不启用，见下）
   -v, --verbose    输出调试信息
   -h, --help       显示帮助
 
@@ -1142,6 +1264,7 @@ main() {
             --dry-run) OPT_DRY_RUN=1 ;;
             --force-qt) OPT_FORCE_QT=1 ;;
             --skip-qt) OPT_SKIP_QT=1 ;;
+            --disable-idle-logout) OPT_NO_IDLE_LOGOUT=1 ;;
             -v|--verbose) OPT_VERBOSE=1 ;;
             -h|--help) usage; exit 0 ;;
             *) err "未知参数: $1"; usage; exit 2 ;;

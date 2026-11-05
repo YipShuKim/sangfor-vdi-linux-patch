@@ -42,7 +42,48 @@ sudo ./sangfor-vdi-linux-patch verify     # 核对结果
 | `revert` | 撤销全部改动，恢复原状 |
 
 常用选项：`-y/--yes` 不询问 · `--dry-run` 只打印操作 · `--force-qt` 强制使用内置 Qt4 ·
-`--skip-qt` 不处理 Qt4。
+`--skip-qt` 不处理 Qt4 · `--disable-idle-logout` 关闭 20 分钟空闲自动登出（可选，见下）。
+
+## 可选功能：关闭 20 分钟空闲自动登出
+
+默认**不启用**。加上 `--disable-idle-logout` 才会部署。
+
+```bash
+sudo ./sangfor-vdi-linux-patch apply --disable-idle-logout
+# 不想要时去掉该参数重跑，会自动移除
+sudo ./sangfor-vdi-linux-patch apply
+```
+
+### 为什么需要它
+
+客户端会读取服务端下发的 `NoInputTimeout`，值大于 0 就启动一个**固定计时循环**，
+到期主动向服务端发 logout（默认 1200 秒）。问题在于这个“空闲”判定是失效的：
+
+- 它每 5ms 轮询一次内部状态，但**起点时间只在进入循环时记录一次，循环中从不更新**
+- 计时精度实测为 1200.011 秒 / 1200.499 秒，**没有任何重置迹象**
+- 即使把用户加入 `input` 组、让进程能读 `/dev/input` 设备节点，结果完全相同
+- 向 `/dev/input` 注入 inotify 事件 5 次，计时器毫无反应
+
+也就是说，在远程桌面场景下它**必然误踢**：你的键盘鼠标输入走 SPICE 通道直达虚拟机，
+不经过本机任何事件源。反过来，同一客户端在 Ubuntu 18.04 上不会踢，是因为那边服务端
+下发的是 0，循环根本没启动。
+
+### 实现方式
+
+`shim/noinput_timeout.c` 编译成一个 `LD_PRELOAD` 库，**只拦截“解析 NoInputTimeout 的那一次
+`atoi` 调用”**（通过返回地址偏移 `0xd2ca8` 精确匹配），让它返回 0，客户端便跳过计时循环。
+进程内其余 `atoi` 调用原样透传，其他 16 个可执行文件完全不受影响。
+
+`vdi_client` 不带 setuid 位，动态链接器会尊重 `LD_PRELOAD`，因此由启动包装注入即可。
+
+### 注意事项
+
+- **偏移与客户端版本绑定**（已在 `5.9.6.2154` 上验证）。客户端升级后若偏移变化，shim
+  不会命中，行为回到厂商默认——**不会更糟，只是失效**。`apply` 会打印版本不匹配的警告。
+- 该 shim 让“空闲自动登出”不再生效，**这会弱化组织的信息安全策略**（防止无人看管时
+  桌面继续在线）。启用前请确认符合所在机构的规定。
+- 如果只想调整时长而不是完全关闭，最合规的做法是让管理员在 VDC 控制台修改
+  该策略值。
 
 ## 补丁做了什么
 
@@ -54,7 +95,8 @@ sudo ./sangfor-vdi-linux-patch verify     # 核对结果
 │   ├── libssl.so.10, libcrypto.so.10
 │   ├── libaudio.so.2
 │   ├── os-release              # ID=ubuntu，仅供 super_agent 使用
-│   └── ldso/                   # setuid 程序专用：只放 3 个无冲突 SONAME
+│   ├── ldso/                   # setuid 程序专用：只放 3 个无冲突 SONAME
+│   └── shim/                   # 可选：libnoinput_timeout.so（关闭空闲登出）
 ├── bin/
 │   ├── vdi_local_client        # 包装脚本：设置 LD_LIBRARY_PATH 后 exec 真身
 │   └── vdi_local_client.real   # 原二进制
@@ -131,12 +173,18 @@ Fedora 系走 dnf / rpm2cpio 路径取 OpenLDAP 2.4。
 - `ld.so.conf.d` 是本补丁唯一触及系统目录的改动。它只引入 `compat/ldso/`，其中 3 个 SONAME
   在系统 ld.so 缓存中原本不存在，因此不改变任何现有程序的动态链接结果；`revert` 完整回滚。
 - 仅适配 glibc 系（Debian/Ubuntu/Fedora 等），不适用于 musl 发行版（Alpine 等）。
+- `--disable-idle-logout` 的 shim 与客户端版本绑定，升级后自动失效（回到厂商默认行为）。
 
 ## 免责声明
 
-本项目与深信服科技无关联，为社区经验整理。补丁只调整**本机客户端运行环境**，不修改、
-不绕过任何客户端授权或网络接入策略，请确保在你的组织允许的范围内使用。建议优先向厂商
-反馈并获取官方适配新系统的客户端；本项目适合作为过渡方案。
+本项目与深信服科技无关联，为社区经验整理。默认行为只调整**本机客户端运行环境**，不修改
+客户端鉴权与网络接入策略。
+
+需要特别说明的是，可选的 `--disable-idle-logout` **会让客户端的空闲自动登出不再生效**，
+这属于对厂商安全设计的改动，可能不符合你所在机构的信息安全规定。请在使用前确认合规性，
+并优先考虑通过 VDC 管理端调整该策略。
+
+建议优先向厂商反馈并获取官方适配新系统的客户端；本项目适合作为过渡方案。
 
 ## 验证记录
 
@@ -150,3 +198,15 @@ Fedora 系走 dnf / rpm2cpio 路径取 OpenLDAP 2.4。
   以 `vdi_session.real -i <sessid> -s 0` 启动后持续运行，不再有 70ms 退出，
   X 窗口 `[<domain-uid> - <desk-name>] (Vdi Session)` 正常显示远程桌面画面
 - 系统侧抽查：`curl` 仍链接 `libldap.so.2`（2.6），未被兼容库替换
+
+### 空闲登出问题的排查与验证
+
+| 结论 | 依据 |
+|---|---|
+| 计时器不响应真实输入 | 1200.011s / 1200.499s 两次实测，误差极小且无重置 |
+| 加 `input` 组无效 | 组权限已生效（进程 groups 含 995），仍准时登出 |
+| 注入 inotify 事件无效 | 5 次触发 `/dev/input` 事件，计时器毫无变化 |
+| 取值路径 | 反汇编：`NoInputTimeout → atoi (0xd2ca83) → 存入 0xa8 → >0 才进入计时循环` |
+| 同客户端在 Ubuntu 18.04 不踢 | 日志显示其 `InputWatch` 无 `end running`，即服务端下发值为 0 |
+| shim 命中验证 | 诊断版实测打印 `atoi("1200") from base+0xd2ca8` |
+| 最终效果 | 启用 shim 后会话持续 23 分钟以上无 `InputWatch` 记录、无 logout、进程存活 |
