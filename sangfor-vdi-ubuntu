@@ -818,10 +818,17 @@ apply_wrappers() {
     for f in "$BIN_DIR"/*.real; do
         [ -f "$f" ] || continue
         local wrap="${f%.real}"
-        if [ -f "$wrap" ] && is_patch_wrapper "$wrap"; then
+        if [ ! -f "$wrap" ]; then
+            run mv -f "$f" "$wrap"
+        elif is_patch_wrapper "$wrap"; then
+            # 占位是包装脚本：删掉它，把原始 ELF 放回原文件名，稍后重新包装
             run rm -f "$wrap"
+            run mv -f "$f" "$wrap"
+        else
+            # 原文件名上已经是原生 ELF（例如客户端刚重装），旧的 .real 是过期副本，
+            # 直接覆盖回去就会把新二进制降级成旧版本——必须丢弃。
+            run rm -f "$f"
         fi
-        run mv -f "$f" "$wrap"
     done
     for f in "$BIN_DIR"/*; do
         [ -f "$f" ] || continue
