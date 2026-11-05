@@ -198,6 +198,20 @@ sudo systemctl disable --now vdi_usbipd
 能。客户端是 Qt4/X11 程序，通过 XWayland 运行；实测 Fedora 45（默认 Wayland）下
 登录框正常显示。仅有一条 `QGtkStyle could not resolve GTK` 的无害提示。
 
+**登录时报"登录异常，请检查网络和服务器地址"？**
+这个提示名不副实，实际与网络无关。两个已确认的原因：
+
+1. **`vdi_webui_agent` 没起来**（登录前的请求都发往 `127.0.0.1:31113`）。
+   它由 `vdi_webui_agent.sh` 拉起，而该脚本用 `pidof vdi_super_agent` 判断前置进程。
+   Fedora 的 `procps-ng` 按 `argv[0]` 匹配，若包装脚本执行的是 `xxx.real`，`pidof` 就找不到，
+   脚本会一直空转。补丁已用 `exec -a` 保留原始 `argv[0]` 修复。自查：
+   `pidof vdi_super_agent && cat /run/sangfor/vdiclient/vdi_webui_agent.listen_port`
+2. **`/etc/sangfor/vdiclient/is_installing_depend` 残留**。`postinst` 会创建它，正常由
+   `install_depend.sh` 完成后删除；但该脚本只认 Ubuntu/Kylin/UOS，在新发行版上永远不删。
+   客户端读到此文件就认为"依赖未安装完整"，`CHECK_VER` 返回 `success:false`，
+   日志出现 `client update! quit client and wait to start`，登录界面随即退出。
+   补丁在依赖齐备后会自动清除它。
+
 **GNOME 的"全部应用"里找不到客户端？**
 客户端自带的 `.desktop` 有两个问题：末尾**没有换行符**，且 `Categories=Application;Development;`
 会让 GNOME 45+ 把它收进「开发」文件夹而不是顶层。重写为规范格式即可：

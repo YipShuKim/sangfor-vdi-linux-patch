@@ -628,6 +628,21 @@ apply_extra_sonames() {
 }
 
 # 全部步骤结束后统一核对一次动态链接，避免中途误报（Qt4/lidn 等在后面才就位）
+# 依赖标记：postinst 会创建，正常由 install_depend.sh 完成后删除；该脚本不认
+# Fedora 等新发行版，标记会一直留着，客户端据此判定"依赖未安装完整"并拒绝登录
+# （表现为 CHECK_VER 返回 success:false，然后"client update! quit client"）。
+clear_depend_flag() {
+    local f="/etc/sangfor/vdiclient/is_installing_depend"
+    [ -n "$OPT_ROOT" ] && f="$OPT_ROOT$f"
+    [ -f "$f" ] || return 0
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 删除依赖标记 $f"
+        return 0
+    fi
+    run rm -f "$f"
+    ok "已清除依赖安装标记（客户端不再误判依赖缺失）"
+}
+
 final_link_check() {
     local t="$BIN_DIR/vdi_local_client.real"
     [ -f "$t" ] || t="$BIN_DIR/vdi_local_client"
@@ -1219,6 +1234,10 @@ do_apply() {
     apply_ldso_whitelist
     # 所有兼容库/Qt4 都就位后再统一核对一次，避免中途误报
     final_link_check
+    # 依赖标记：postinst 会创建 /etc/sangfor/vdiclient/is_installing_depend，
+    # 正常由 install_depend.sh 完成后删除；该脚本不认新发行版，标记会一直留着，
+    # 客户端据此判定"依赖未安装完整"，CHECK_VER 返回 false 并拒绝登录。
+    clear_depend_flag
 
     if [ "$OPT_DRY_RUN" -eq 0 ]; then
         touch "$CLIENT_DIR/$MARKER" 2>/dev/null || true
