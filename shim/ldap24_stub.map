@@ -1,0 +1,30 @@
+OPENLDAP_2.4_2 {
+    global:
+        /* liblber */
+        ber_free;
+        ber_memfree;
+        ber_sockbuf_add_io;
+        /* libldap */
+        ldap_abandon_ext;
+        ldap_err2string;
+        ldap_first_message;
+        ldap_free_urldesc;
+        ldap_get_attribute_ber;
+        ldap_get_dn_ber;
+        ldap_get_option;
+        ldap_init_fd;
+        ldap_memfree;
+        ldap_msgfree;
+        ldap_msgtype;
+        ldap_next_message;
+        ldap_parse_result;
+        ldap_pvt_url_scheme2proto;
+        ldap_result;
+        ldap_sasl_bind;
+        ldap_search_ext;
+        ldap_set_option;
+        ldap_unbind_ext;
+        ldap_url_parse;
+    local:
+        *;
+};

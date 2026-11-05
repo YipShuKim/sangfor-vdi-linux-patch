@@ -53,10 +53,16 @@ EXPECTED_QT_PREFIX="/usr/local/Trolltech/Qt-4.8.7"
 # 官方 Qt4.8.7 以及兼容 gtk2/libaudio 的 LTS，且构建于 glibc 2.27 上，在现代发行版可直接运行。
 BIONIC_BASE="${BIONIC_BASE:-http://archive.ubuntu.com/ubuntu/pool}"
 OPENLDAP24_DEB_BASE="${OPENLDAP24_DEB_BASE:-$BIONIC_BASE/main/o/openldap}"
-OPENLDAP24_RPM_BASE="${OPENLDAP24_RPM_BASE:-https://dl.fedoraproject.org/pub/archive/epel/8/Everything/x86_64/Packages/o}"
+OPENLDAP24_RPM_BASE="${OPENLDAP24_RPM_BASE:-https://archives.fedoraproject.org/pub/archive/fedora/linux/releases/35/Everything/x86_64/os/Packages/o}"
 QT4_DEB_BASE="${QT4_DEB_BASE:-$BIONIC_BASE/universe/q/qt4-x11}"
 OPENSSL10_DEB_BASE="${OPENSSL10_DEB_BASE:-$BIONIC_BASE/main/o/openssl1.0}"
 LIBAUDIO2_DEB_BASE="${LIBAUDIO2_DEB_BASE:-$BIONIC_BASE/main/n/nas}"
+LIBIDN11_DEB_BASE="${LIBIDN11_DEB_BASE:-$BIONIC_BASE/main/libi/libidn}"
+# Debian 的 libldap-2.4 还依赖两个 Fedora 已换代的库
+LIBSASL2_DEB_BASE="${LIBSASL2_DEB_BASE:-$BIONIC_BASE/main/c/cyrus-sasl2}"
+LIBGSSAPI3_DEB_BASE="${LIBGSSAPI3_DEB_BASE:-$BIONIC_BASE/main/h/heimdal}"
+# 现代发行版已不再提供 libidn1（只剩 libidn2），客户端经 libcurl 依赖它
+LIBIDN_SONAME="libidn.so.11"
 
 # 可选行为
 OPT_FORCE_QT=0
@@ -87,6 +93,19 @@ warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*"; }
 err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 dbg()  { [ "$OPT_VERBOSE" -eq 1 ] && printf '[D] %s\n' "$*"; return 0; }
+
+# set -o pipefail 下，`大输出命令 | grep -q` 会因 grep 提前退出让左侧收到 SIGPIPE
+# （退出码 141），整个管道被判为失败——哪怕明明匹配到了。这里先把输出落盘再匹配。
+pipe_match() {
+    local pat="$1"; shift
+    local f rc
+    f="$(mktemp)"
+    "$@" >"$f" 2>/dev/null || true
+    grep -qE -- "$pat" "$f"
+    rc=$?
+    rm -f "$f"
+    return "$rc"
+}
 
 confirm() {
     [ "$OPT_ASSUME_YES" -eq 1 ] && return 0
@@ -174,12 +193,15 @@ pkg_installed() {
 obj_has_openldap24() {
     local f="$1"
     [ -f "$f" ] || return 1
-    objdump -p "$f" 2>/dev/null | grep -q "$NEED_OPENLDAP_VER"
+    pipe_match "$NEED_OPENLDAP_VER" objdump -p "$f"
 }
 
 system_ldap_ok() {
     local f
-    for f in $(ldconfig -p 2>/dev/null | awk '/libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2/ {print $NF}'); do
+    # 排除本补丁自己注册进 ld.so 的兼容库/桩库，否则会误判成"系统已有"
+    for f in $(ldconfig -p 2>/dev/null \
+               | awk '/libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2/ {print $NF}' \
+               | grep -v "/sangfor/" ); do
         obj_has_openldap24 "$f" && return 0
     done
     return 1
@@ -189,7 +211,7 @@ curl_needs_openldap24() {
     local curl="$LIB_DIR/libcurl.so.4.4.0"
     [ -f "$curl" ] || curl="$LIB_DIR/libcurl.so.4"
     [ -f "$curl" ] || return 1
-    objdump -p "$curl" 2>/dev/null | grep -q "$NEED_OPENLDAP_VER"
+    pipe_match "$NEED_OPENLDAP_VER" objdump -p "$curl"
 }
 
 # 下载工具选择。--retry 必须有上限，否则源端限速时会长时间挂住。
@@ -261,77 +283,39 @@ _fetch_first_ok() {
     return 1
 }
 
-# 获取 OpenLDAP 2.4 兼容库：优先本机软件源，其次 Ubuntu 18.04 归档
-fetch_openldap24() {
-    local dest="$1" tmp
-    tmp="$(mktemp -d)"
-    local got=0
-
-    case "$PKG_FAMILY" in
-        deb)
-            local work="$tmp/src"
-            mkdir -p "$work"
-            # 本机源仍有 libldap-2.4-2 时（Debian 12 等）直接取
-            if ( cd "$work" && "$PKG_MGR" download libldap-2.4-2 >/dev/null 2>&1 ); then
-                local deb
-                for deb in "$work"/libldap-2.4-2_*.deb; do
-                    [ -f "$deb" ] || continue
-                    dpkg-deb -x "$deb" "$tmp/x" && got=1 && break
-                done
-            fi
-            if [ "$got" -eq 0 ]; then
-                # 直连已知文件名，省一次目录请求（镜像的补丁版本可能不同，逐个降级）
-                local name
-                name="$(_fetch_first_ok "$OPENLDAP24_DEB_BASE" "$work" \
-                         libldap-2.4-2_2.4.49+dfsg-2ubuntu1.10_amd64.deb \
-                         libldap-2.4-2_2.4.49+dfsg-2ubuntu1_amd64.deb \
-                         libldap-2.4-2_2.4.45+dfsg-1ubuntu1.11_amd64.deb \
-                         libldap-2.4-2_2.4.45+dfsg-1ubuntu1_amd64.deb)"
-                if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_DEB_BASE"; then
-                    name="$(pick_highest 'libldap-2\.4-2_2\.4\.[^"<>]+amd64\.deb')"
-                    [ -n "$name" ] && _fetch "$OPENLDAP24_DEB_BASE/$name" "$work/$name"
-                fi
-                if [ -n "$name" ] && [ -s "$work/$name" ] \
-                   && dpkg-deb -x "$work/$name" "$tmp/x"; then
-                    got=1
-                fi
-            fi ;;
-        rpm)
-            local name
-            name="$(pick_highest 'openldap-2\.4[^"<>]*x86_64\.rpm' 2>/dev/null)"
-            if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_RPM_BASE"; then
-                name="$(pick_highest 'openldap-2\.4[^"<>]*x86_64\.rpm')"
-            fi
-            if [ -n "$name" ]; then
-                # EPEL 目录按包名分页，直接按名抓取即可
-                _fetch "$OPENLDAP24_RPM_BASE/$name" "$tmp/$name" || _fetch "$(dirname "$OPENLDAP24_RPM_BASE")/$name" "$tmp/$name" || true
-                if [ -f "$tmp/$name" ]; then
-                    mkdir -p "$tmp/x"
-                    ( cd "$tmp/x" && rpm2cpio "$tmp/$name" | cpio -idm --quiet ) && got=1
-                fi
-            fi
-            if [ "$got" -eq 0 ] && command -v dnf >/dev/null 2>&1; then
-                # 兜底：CentOS Stream 8 的 openldap 2.4 客户端库
-                if dnf download --destdir "$tmp" --releasever=8 --repoid=ol8_appstream openldap 2>/dev/null \
-                   || dnf download --destdir "$tmp" --releasever=8 centos-stream-8-baseos-openldap 2>/dev/null; then
-                    local r
-                    for r in "$tmp"/*.rpm; do
-                        [ -f "$r" ] || continue
-                        mkdir -p "$tmp/x"
-                        ( cd "$tmp/x" && rpm2cpio "$r" | cpio -idm --quiet ) && got=1
-                    done
-                fi
-            fi ;;
-    esac
-
-    if [ "$got" -eq 0 ]; then
-        rm -rf "$tmp"
-        return 1
+# 解包 .deb，不依赖 dpkg（Fedora 上 dpkg 不是必备组件）
+extract_deb() {
+    local deb="$1" dest="$2" member
+    if command -v dpkg-deb >/dev/null 2>&1; then
+        dpkg-deb -x "$deb" "$dest"
+        return
     fi
+    command -v ar >/dev/null 2>&1 || return 1
+    member="$(ar t "$deb" 2>/dev/null | grep '^data\.tar' | head -1)"
+    [ -n "$member" ] || return 1
+    mkdir -p "$dest"
+    case "$member" in
+        *.tar.zst) ar p "$deb" "$member" | tar --zstd -xf - -C "$dest" ;;
+        *.tar.xz)  ar p "$deb" "$member" | tar -xJf - -C "$dest" ;;
+        *.tar.gz)  ar p "$deb" "$member" | tar -xzf - -C "$dest" ;;
+        *.tar.bz2) ar p "$deb" "$member" | tar -xjf - -C "$dest" ;;
+        *)         ar p "$deb" "$member" | tar -xf - -C "$dest" ;;
+    esac
+}
 
-    local found=0 f bn
-    # 注意不能用 usr/lib*/xxx 这种通配：* 只跨一层路径，匹配不到
-    # usr/lib/x86_64-linux-gnu/ 这样的深层目录，必须用 find。
+# 解包 .rpm，同样只依赖 rpm2cpio/cpio
+extract_rpm() {
+    local rpm="$1" dest="$2"
+    mkdir -p "$dest"
+    ( cd "$dest" && rpm2cpio "$rpm" | cpio -idm --quiet ) || true
+    find "$dest" -name 'libldap_r-2.4.so.2.*' -o -name 'liblber-2.4.so.2.*' 2>/dev/null | grep -q . 
+}
+
+# 从解包树里挑出真正带 OPENLDAP_2.4_2 的库并安装到 dest。
+# 注意：部分发行版（Fedora 的 openldap 2.4.59）虽然文件名对，但没导出该符号版本，
+# 必须逐个校验，否则装上去依然解析不了。
+_install_openldap_from_tree() {
+    local tree="$1" dest="$2" f bn found=0
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         obj_has_openldap24 "$f" || continue
@@ -343,10 +327,77 @@ fetch_openldap24() {
         esac
         found=1
     done <<EOF
-$(find "$tmp/x" \( -name 'libldap_r-2.4.so.2.*' -o -name 'liblber-2.4.so.2.*' \) -type f 2>/dev/null)
+$(find "$tree" \( -name 'libldap_r-2.4.so.2.*' -o -name 'liblber-2.4.so.2.*' \) -type f 2>/dev/null)
 EOF
-    rm -rf "$tmp"
     [ "$found" -eq 1 ]
+}
+
+# 从 Ubuntu 18.04 归档取（唯一确定带 OPENLDAP_2.4_2 的来源）
+_fetch_openldap_deb() {
+    local dest="$1" tmp="$2" work="$2/src" name
+    mkdir -p "$work"
+    name="$(_fetch_first_ok "$OPENLDAP24_DEB_BASE" "$work" \
+             libldap-2.4-2_2.4.49+dfsg-2ubuntu1.10_amd64.deb \
+             libldap-2.4-2_2.4.49+dfsg-2ubuntu1_amd64.deb \
+             libldap-2.4-2_2.4.45+dfsg-1ubuntu1.11_amd64.deb \
+             libldap-2.4-2_2.4.45+dfsg-1ubuntu1_amd64.deb)"
+    if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_DEB_BASE"; then
+        name="$(pick_highest 'libldap-2\.4-2_2\.4\.[^"<>]+amd64\.deb')"
+        [ -n "$name" ] && _fetch "$OPENLDAP24_DEB_BASE/$name" "$work/$name"
+    fi
+    if [ -n "$name" ] && [ -s "$work/$name" ] && extract_deb "$work/$name" "$tmp/x"; then
+        _install_openldap_from_tree "$tmp/x" "$dest"
+        return
+    fi
+    return 1
+}
+
+# 获取 OpenLDAP 2.4 兼容库。
+# 策略：优先本机软件源（少一次外网请求），但**必须校验 OPENLDAP_2.4_2 符号版本**；
+# 不合格就回落到 Ubuntu 18.04 归档。
+fetch_openldap24() {
+    local dest="$1" tmp
+    tmp="$(mktemp -d)"
+
+    case "$PKG_FAMILY" in
+        deb)
+            # Debian 12 / Ubuntu 22.04 源里仍有 libldap-2.4-2
+            local work="$tmp/src"
+            mkdir -p "$work"
+            if ( cd "$work" && "$PKG_MGR" download libldap-2.4-2 >/dev/null 2>&1 ); then
+                local deb
+                for deb in "$work"/libldap-2.4-2_*.deb; do
+                    [ -f "$deb" ] || continue
+                    extract_deb "$deb" "$tmp/x" || continue
+                    if _install_openldap_from_tree "$tmp/x" "$dest"; then
+                        rm -rf "$tmp"
+                        return 0
+                    fi
+                done
+            fi ;;
+        rpm)
+            # Fedora 归档的 openldap 2.4 往往缺符号版本，先试一次再说
+            if command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
+                local name
+                if [ -z "$name" ] && cache_dir_listing "$OPENLDAP24_RPM_BASE" 2>/dev/null; then
+                    name="$(pick_highest 'openldap-2\.4[^"<>]*x86_64\.rpm')"
+                fi
+                if [ -n "$name" ] && _fetch "$OPENLDAP24_RPM_BASE/$name" "$tmp/$name"; then
+                    if extract_rpm "$tmp/$name" "$tmp/x" && _install_openldap_from_tree "$tmp/x" "$dest"; then
+                        rm -rf "$tmp"
+                        return 0
+                    fi
+                fi
+            fi ;;
+    esac
+
+    # 本机包不可用或版本符号不合格 → 回落 Ubuntu 18.04 归档
+    if _fetch_openldap_deb "$dest" "$tmp"; then
+        rm -rf "$tmp"
+        return 0
+    fi
+    rm -rf "$tmp"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -359,7 +410,7 @@ curl_needs_openssl10() {
     local curl="$LIB_DIR/libcurl.so.4.4.0"
     [ -f "$curl" ] || curl="$LIB_DIR/libcurl.so.4"
     [ -f "$curl" ] || return 1
-    objdump -p "$curl" 2>/dev/null | grep -q "OPENSSL_1\.0"
+    pipe_match "OPENSSL_1\.0" objdump -p "$curl"
 }
 
 binaries_need_ssl10() {
@@ -368,7 +419,7 @@ binaries_need_ssl10() {
         [ -f "$f" ] || continue
         is_elf "$f" || continue
         case "$f" in *.real) ;; esac
-        objdump -p "$f" 2>/dev/null | grep -q "libssl.so.10" && return 0
+        pipe_match "libssl\.so\.10" objdump -p "$f" && return 0
     done
     return 1
 }
@@ -417,7 +468,7 @@ fetch_ssl10() {
     local deb
     for deb in "$tmp"/libssl1.0.0_*.deb; do
         [ -f "$deb" ] || continue
-        dpkg-deb -x "$deb" "$tmp/x" || { rm -rf "$tmp"; return 1; }
+        extract_deb "$deb" "$tmp/x" || { rm -rf "$tmp"; return 1; }
         local f bn
         while IFS= read -r f; do
             [ -f "$f" ] || continue
@@ -443,7 +494,7 @@ fetch_libaudio2() {
     local f bn okc=0
     for f in "$tmp"/libaudio2_*.deb; do
         [ -f "$f" ] || continue
-        dpkg-deb -x "$f" "$tmp/x" || continue
+        extract_deb "$f" "$tmp/x" || continue
         local g
         while IFS= read -r g; do
             [ -f "$g" ] || continue
@@ -457,6 +508,140 @@ EOF
     done
     rm -rf "$tmp"
     [ "$okc" -eq 1 ]
+}
+
+# 系统里是否已有某 SONAME（直接查文件比 ldconfig 缓存可靠）
+system_has_soname() {
+    local s="$1" p
+    for p in "/usr/lib64/$s" "/usr/lib/$s" "/lib64/$s" "/lib/$s" \
+             /usr/lib/*/"$s" /lib/*/"$s"; do
+        [ -e "$p" ] && return 0
+    done
+    pipe_match " $s " ldconfig -p && return 0
+    return 1
+}
+
+# 通用：从 .deb 里取某个 SONAME 的库（实体文件 + 无版本软链）。
+# 用于现代发行版已移除、但客户端仍依赖的基础库。
+fetch_lib_from_deb() {
+    local dest="$1" base="$2" pattern="$3" soname="$4"
+    shift 4
+    local tmp name f bn okc=0
+    tmp="$(mktemp -d)"
+    name="$(_fetch_first_ok "$base" "$tmp" "$@")"
+    if [ -z "$name" ] && cache_dir_listing "$base"; then
+        name="$(pick_highest "$pattern")"
+        [ -n "$name" ] && _fetch "$base/$name" "$tmp/$name"
+    fi
+    [ -n "$name" ] && [ -s "$tmp/$name" ] || { rm -rf "$tmp"; return 1; }
+    extract_deb "$tmp/$name" "$tmp/x" || { rm -rf "$tmp"; return 1; }
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        bn="$(basename "$f")"
+        cp -a "$f" "$dest/$bn"
+        ln -sf "$bn" "$dest/$soname"
+        okc=1
+    done <<EOF
+$(find "$tmp/x" -name "${soname}.*" -type f 2>/dev/null)
+EOF
+    rm -rf "$tmp"
+    [ "$okc" -eq 1 ]
+}
+
+# 兼容库缺失时的其余基础库：现代发行版已换成新版 SONAME，只能自带
+#   libidn.so.11    ← Fedora 45 / Ubuntu 24.04 只剩 libidn2
+#   libsasl2.so.2   ← Fedora 只提供 libsasl2.so.3
+#   libgssapi.so.3  ← Fedora 用 MIT krb5 的 libgssapi_krb5.so.2，没有 Heimdal
+apply_extra_sonames() {
+    local missing="" s base pat names
+
+    # 逐项：SONAME → 来源包
+    _need_lib() {
+        local soname="$1" base="$2" pat="$3"
+        shift 3
+        system_has_soname "$soname" && return 0
+        if [ -f "$COMPAT_DIR/$soname" ]; then
+            ok "$soname 兼容库已就位"
+            return 0
+        fi
+        info "系统缺少 $soname，获取兼容库..."
+        run mkdir -p "$COMPAT_DIR"
+        if [ "$OPT_DRY_RUN" -eq 0 ] && fetch_lib_from_deb "$COMPAT_DIR" "$base" "$pat" "$soname" "$@"; then
+            chown 0:0 "$COMPAT_DIR/$soname"* 2>/dev/null || true
+            ok "$soname 兼容库已就位"
+            return 0
+        fi
+        if [ "$OPT_DRY_RUN" -eq 0 ]; then
+            warn "无法获取 $soname；若启动报该库缺失，请手工放入 $COMPAT_DIR/"
+            FAILED=$((FAILED + 1))
+        fi
+        return 1
+    }
+
+    _need_lib "$LIBIDN_SONAME" "$LIBIDN11_DEB_BASE" 'libidn11_[^"<>]+amd64\.deb' \
+        libidn11_1.33-2.2ubuntu2_amd64.deb \
+        libidn11_1.33-2.1ubuntu1.2_amd64.deb \
+        libidn11_1.33-2.1ubuntu1_amd64.deb
+    # 以下仅在"真实 libldap 2.4"模式下才需要：
+    # Debian 的 libldap 链接 cyrus-sasl 2 与 Heimdal（libgssapi.so.3），
+    # Fedora 上分别是 libsasl2.so.3 与 MIT krb5。用桩库时这些依赖根本不存在。
+    if [ "${LDAP_MODE:-none}" = "real" ]; then
+        _need_lib "libsasl2.so.2" "$LIBSASL2_DEB_BASE" 'libsasl2-2_[^"<>]+amd64\.deb' \
+            libsasl2-2_2.1.28+dfsg1-11ubuntu2_amd64.deb \
+            libsasl2-2_2.1.28+dfsg1-9ubuntu3_amd64.deb \
+            libsasl2-2_2.1.28+dfsg1-5ubuntu3_amd64.deb
+        _need_lib "libgssapi.so.3" "$LIBGSSAPI3_DEB_BASE" 'libgssapi3-heimdal_[^"<>]+amd64\.deb' \
+            libgssapi3-heimdal_7.7.0+dfsg-1ubuntu1.4_amd64.deb \
+            libgssapi3-heimdal_7.7.0+dfsg-1ubuntu1_amd64.deb \
+            libgssapi3-heimdal_7.5.0+dfsg-1_amd64.deb
+
+        local hv="7.7.0+dfsg-1ubuntu1"
+        _need_lib "libasn1.so.8" "$LIBGSSAPI3_DEB_BASE" 'libasn1-8-heimdal_[^"<>]+amd64\.deb' \
+            "libasn1-8-heimdal_${hv}_amd64.deb" "libasn1-8-heimdal_${hv}.4_amd64.deb"
+        _need_lib "libhcrypto.so.4" "$LIBGSSAPI3_DEB_BASE" 'libhcrypto4-heimdal_[^"<>]+amd64\.deb' \
+            "libhcrypto4-heimdal_${hv}_amd64.deb" "libhcrypto4-heimdal_${hv}.4_amd64.deb"
+        _need_lib "libheimntlm.so.0" "$LIBGSSAPI3_DEB_BASE" 'libheimntlm0-heimdal_[^"<>]+amd64\.deb' \
+            "libheimntlm0-heimdal_${hv}_amd64.deb" "libheimntlm0-heimdal_${hv}.4_amd64.deb"
+        _need_lib "libkrb5.so.26" "$LIBGSSAPI3_DEB_BASE" 'libkrb5-26-heimdal_[^"<>]+amd64\.deb' \
+            "libkrb5-26-heimdal_${hv}_amd64.deb" "libkrb5-26-heimdal_${hv}.4_amd64.deb"
+        _need_lib "libroken.so.18" "$LIBGSSAPI3_DEB_BASE" 'libroken18-heimdal_[^"<>]+amd64\.deb' \
+            "libroken18-heimdal_${hv}_amd64.deb" "libroken18-heimdal_${hv}.4_amd64.deb"
+    fi
+
+    # librtmp.so.1 — 各发行版仍提供，用系统包，避免把第三方构建塞进全局链接路径
+    if ! system_has_soname "librtmp.so.1"; then
+        case "$PKG_FAMILY" in
+            deb) missing="librtmp1" ;;
+            rpm) missing="librtmp" ;;
+        esac
+        if [ -n "$missing" ] && command -v "$PKG_MGR" >/dev/null 2>&1; then
+            info "系统缺少 librtmp.so.1，尝试安装 $missing"
+            pkg_install "$missing" >/dev/null 2>&1 || true
+            if system_has_soname "librtmp.so.1"; then
+                ok "librtmp.so.1 已由系统包提供"
+            else
+                warn "未能安装 $missing；若启动报 librtmp.so.1 缺失，请手工安装对应包"
+                FAILED=$((FAILED + 1))
+            fi
+        fi
+    fi
+}
+
+# 全部步骤结束后统一核对一次动态链接，避免中途误报（Qt4/lidn 等在后面才就位）
+final_link_check() {
+    local t="$BIN_DIR/vdi_local_client.real"
+    [ -f "$t" ] || t="$BIN_DIR/vdi_local_client"
+    [ -f "$t" ] || return 0
+    local out nf
+    out="$(LD_LIBRARY_PATH="$EXPECTED_QT_PREFIX/lib:$COMPAT_DIR:$LIB_DIR" ldd "$t" 2>&1)"
+    nf="$(printf '%s\n' "$out" | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
+    if [ -z "$nf" ]; then
+        ok "动态链接检查通过（无 not found）"
+    else
+        warn "仍有未解析的依赖: $nf"
+        warn "Qt/ldap/lber/audio/idn 由本补丁提供，其余需系统包补齐"
+        FAILED=$((FAILED + 1))
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -478,7 +663,7 @@ qt4_in_prefix() {
 qt4_system_sonames() {
     local f
     for f in $NEED_QT_SONAMES; do
-        ldconfig -p 2>/dev/null | grep -q " $f " || return 1
+        system_has_soname "$f" || return 1
     done
     return 0
 }
@@ -506,7 +691,7 @@ fetch_qt4() {
                 libqt4-svg_4.8.7+dfsg-7ubuntu1_amd64.deb; do
         _fetch "$QT4_DEB_BASE/$name" "$tmp/$name" || continue
         [ -s "$tmp/$name" ] || continue
-        dpkg-deb -x "$tmp/$name" "$tmp/x" && okc=1
+        extract_deb "$tmp/$name" "$tmp/x" && okc=1
     done
     # 上面是直连；若镜像或归档布局变化导致全部失败，退回目录列表择优
     if [ "$okc" -eq 0 ] && cache_dir_listing "$QT4_DEB_BASE"; then
@@ -515,7 +700,7 @@ fetch_qt4() {
             name="$(pick_highest "${p}_4\.8\.7[^\"<>]*_amd64\.deb")"
             [ -n "$name" ] || continue
             _fetch "$QT4_DEB_BASE/$name" "$tmp/$name" || continue
-            dpkg-deb -x "$tmp/$name" "$tmp/x" && okc=1
+            extract_deb "$tmp/$name" "$tmp/x" && okc=1
         done
     fi
     if [ "$okc" -eq 0 ]; then rm -rf "$tmp"; return 1; fi
@@ -700,7 +885,7 @@ EOF
 #     （系统的 OpenLDAP 是 libldap.so.2，不是 libldap_r-2.4.so.2）
 #   - 通过 /etc/ld.so.conf.d 的一个专用文件挂进去，卸载只需删文件 + ldconfig
 LDSO_DIR_NAME="ldso"
-LDSO_WHITELIST="libldap_r-2.4.so.2 liblber-2.4.so.2 libaudio.so.2"
+LDSO_WHITELIST="libldap_r-2.4.so.2 liblber-2.4.so.2 libaudio.so.2 libidn.so.11 libsasl2.so.2 libgssapi.so.3 libasn1.so.8 libhcrypto.so.4 libheimntlm.so.0 libkrb5.so.26 libroken.so.18"
 LDSO_CONF="/etc/ld.so.conf.d/sangfor-vdi-compat.conf"
 
 setuid_binaries() {
@@ -711,7 +896,7 @@ needs_ldso_whitelist() {
     local f
     for f in $(setuid_binaries); do
         # setuid 程序自身未必直接依赖旧库，可能是经由 libcurl 间接依赖
-        if objdump -p "$f" 2>/dev/null | grep -qE 'libcurl\.so\.4|libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2|libaudio\.so\.2'; then
+        if pipe_match 'libcurl\.so\.4|libldap_r-2\.4\.so\.2|liblber-2\.4\.so\.2|libaudio\.so\.2|libidn\.so\.11' objdump -p "$f"; then
             return 0
         fi
     done
@@ -782,31 +967,90 @@ restore_binaries() {
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
+# compat 里的 libldap 是否为桩库（源码里嵌了 SGV_LDAP24_STUB 标记）
+is_ldap_stub() {
+    [ -f "$COMPAT_DIR/libldap_r-2.4.so.2" ] || return 1
+    grep -qa "SGV_LDAP24_STUB" "$COMPAT_DIR/libldap_r-2.4.so.2" 2>/dev/null
+}
+
+# 真实 libldap 2.4 能否真正加载（它可能还依赖发行版缺失的库，如 Heimdal）
+compat_ldap_usable() {
+    [ -f "$COMPAT_DIR/libldap_r-2.4.so.2" ] || return 1
+    local out
+    out="$(LD_LIBRARY_PATH="$COMPAT_DIR:$LIB_DIR" ldd "$COMPAT_DIR/libldap_r-2.4.so.2" 2>&1)"
+    printf '%s\n' "$out" | grep -q "not found" && return 1
+    return 0
+}
+
+# 构建 OpenLDAP 2.4 桩库：只导出 libcurl 引用的 23 个符号并带 OPENLDAP_2.4_2
+build_ldap_stub() {
+    local dest="$1" src ccb
+    src="$(shim_source_dir)" || { warn "找不到 ldap24_stub.c"; return 1; }
+    [ -f "$src/ldap24_stub.map" ] || { warn "找不到 ldap24_stub.map"; return 1; }
+    ccb="$(command -v cc || command -v gcc || true)"
+    [ -n "$ccb" ] || { warn "未找到 C 编译器，无法构建 LDAP 桩库"; return 1; }
+    mkdir -p "$dest"
+    # 必须分别编译：SONAME 决定 ld.so 如何登记该库，两个文件共用同一 SONAME
+    # 会导致其中一个被判为 not found。
+    "$ccb" -shared -fPIC -O2 -Wl,--version-script="$src/ldap24_stub.map" \
+        -Wl,-soname,libldap_r-2.4.so.2 \
+        -o "$dest/libldap_r-2.4.so.2" "$src/ldap24_stub.c" || return 1
+    "$ccb" -shared -fPIC -O2 -Wl,--version-script="$src/ldap24_stub.map" \
+        -Wl,-soname,liblber-2.4.so.2 \
+        -o "$dest/liblber-2.4.so.2" "$src/ldap24_stub.c" || return 1
+    return 0
+}
+
 apply_openldap() {
+    LDAP_MODE="none"
     if ! curl_needs_openldap24; then
         ok "客户端 libcurl 不依赖 OpenLDAP 2.4，跳过"
         return
     fi
     if system_ldap_ok; then
+        LDAP_MODE="system"
         ok "系统 OpenLDAP 已是 2.4 且有 $NEED_OPENLDAP_VER"
         return
     fi
-    if obj_has_openldap24 "$COMPAT_DIR/libldap_r-2.4.so.2"; then
-        ok "兼容库中已有 OpenLDAP 2.4（$COMPAT_DIR）"
+    if is_ldap_stub; then
+        LDAP_MODE="stub"
+        ok "OpenLDAP 2.4 桩库已就位（仅满足链接）"
         return
     fi
-    info "系统 OpenLDAP 不含 $NEED_OPENLDAP_VER，获取 OpenLDAP 2.4 兼容库..."
+    if obj_has_openldap24 "$COMPAT_DIR/libldap_r-2.4.so.2" && compat_ldap_usable; then
+        LDAP_MODE="real"
+        ok "兼容库中已有可用的 OpenLDAP 2.4（$COMPAT_DIR）"
+        return
+    fi
+
+    info "系统 OpenLDAP 不含 $NEED_OPENLDAP_VER，准备兼容库..."
     run mkdir -p "$COMPAT_DIR"
     if [ "$OPT_DRY_RUN" -eq 1 ]; then
-        log "[dry-run] fetch OpenLDAP 2.4 into $COMPAT_DIR"
+        log "[dry-run] 获取/构建 OpenLDAP 2.4 兼容库到 $COMPAT_DIR"
         return
     fi
-    if fetch_openldap24 "$COMPAT_DIR"; then
+
+    # 先尝试真实库
+    if fetch_openldap24 "$COMPAT_DIR" && compat_ldap_usable; then
         chown 0:0 "$COMPAT_DIR"/lib*-2.4.so.2* 2>/dev/null || true
-        ok "OpenLDAP 2.4 兼容库已就位"
+        LDAP_MODE="real"
+        ok "OpenLDAP 2.4 真实兼容库已就位"
+        return
+    fi
+
+    # 真实库拿不到、或它的依赖链在本发行版上无法满足（如 Fedora 缺 Heimdal 全套）
+    # → 改用桩库。客户端自身从不调用 LDAP，LDAP 仅是 curl 的可选协议支持。
+    warn "OpenLDAP 2.4 真实库在本系统上无法完整加载，改用桩库"
+    warn "（客户端不使用 LDAP；桩库只满足动态链接，不提供 LDAP 功能）"
+    if build_ldap_stub "$COMPAT_DIR"; then
+        # 清掉真实库残留（版本化文件），避免留无用文件与混淆
+        rm -f "$COMPAT_DIR"/libldap_r-2.4.so.2.* "$COMPAT_DIR"/liblber-2.4.so.2.* 2>/dev/null || true
+        chown 0:0 "$COMPAT_DIR/libldap_r-2.4.so.2" "$COMPAT_DIR/liblber-2.4.so.2" 2>/dev/null || true
+        chmod 644 "$COMPAT_DIR/libldap_r-2.4.so.2" "$COMPAT_DIR/liblber-2.4.so.2"
+        LDAP_MODE="stub"
+        ok "OpenLDAP 2.4 桩库已就位（仅满足链接）"
     else
-        warn "无法自动获取 OpenLDAP 2.4（网络或镜像不可用）。"
-        warn "请手工把含 $NEED_OPENLDAP_VER 的 libldap_r-2.4.so.2 / liblber-2.4.so.2 放入 $COMPAT_DIR/"
+        warn "无法构建桩库；请手工把含 $NEED_OPENLDAP_VER 的库放入 $COMPAT_DIR/"
         FAILED=$((FAILED + 1))
     fi
 }
@@ -962,6 +1206,8 @@ do_apply() {
 
     apply_openldap
     apply_openssl
+    # 现代发行版移除的其余基础库（libidn1 / librtmp）
+    apply_extra_sonames
     apply_os_release
     apply_qt
     # 可选功能要先准备好 shim，包装脚本才会按需注入
@@ -969,6 +1215,8 @@ do_apply() {
     apply_wrappers
     # setuid 程序依赖 compat 里的库时，必须先有这些库再注册 ld.so 白名单
     apply_ldso_whitelist
+    # 所有兼容库/Qt4 都就位后再统一核对一次，避免中途误报
+    final_link_check
 
     if [ "$OPT_DRY_RUN" -eq 0 ]; then
         touch "$CLIENT_DIR/$MARKER" 2>/dev/null || true
@@ -1172,6 +1420,10 @@ do_diagnose() {
         log "libssl.so.10:  不需要"
     fi
     compat_has_libaudio && log "libaudio.so.2: 兼容库已就位" || log "libaudio.so.2: 兼容库缺失（Qt4 需要）"
+    if system_has_soname "$LIBIDN_SONAME"; then log "libidn.so.11:  系统提供"
+    elif [ -f "$COMPAT_DIR/$LIBIDN_SONAME" ]; then log "libidn.so.11:  兼容库已就位"
+    else log "libidn.so.11:  缺失（新版发行版只剩 libidn2）"; fi
+    system_has_soname "librtmp.so.1" && log "librtmp.so.1:  系统提供" || log "librtmp.so.1:  缺失"
     log ""
     log "=== 3. 系统识别 ==="
     log "系统 ID:   $OS_ID"

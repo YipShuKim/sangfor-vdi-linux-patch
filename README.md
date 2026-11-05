@@ -137,9 +137,25 @@ sudo BIONIC_BASE=http://mirror.example.com/ubuntu/pool ./sangfor-vdi-linux-patch
 ```
 
 也可以按包单独覆盖：`OPENLDAP24_DEB_BASE`、`OPENSSL10_DEB_BASE`、`QT4_DEB_BASE`、
-`LIBAUDIO2_DEB_BASE`、`OPENLDAP24_RPM_BASE`。
+`LIBAUDIO2_DEB_BASE`、`LIBIDN11_DEB_BASE`、`OPENLDAP24_RPM_BASE`。
 
-Fedora 系走 dnf / rpm2cpio 路径取 OpenLDAP 2.4。
+### OpenLDAP 2.4：真实库 与 桩库
+
+补丁会先尝试本机软件源（Debian 系取 `libldap-2.4-2`，Fedora 取归档里的 RPM），
+但**必须验证它真的导出 `OPENLDAP_2.4_2` 符号版本**——Fedora 的
+`openldap-2.4.59` 虽然文件名齐全，却只是用了该版本符号、并未定义，所以不合格。
+
+本机包不合格时回落到 Ubuntu 18.04 的真实库。如果这个真实库的**依赖链**在本系统上
+仍无法满足（Fedora 只有 MIT krb5 和 `libsasl2.so.3`，而 Debian 的 libldap 要
+Heimdal `libgssapi.so.3` 和 `libsasl2.so.2`，继续追下去会牵出一整串加密库），
+补丁改为构建一个**桩库**：
+
+- 只导出 `libcurl` 实际引用的 23 个符号，并打上 `OPENLDAP_2.4_2` 版本号
+- 源码见 `shim/ldap24_stub.c`，被调用时一律返回失败，不伪造成功
+- 依据：客户端**没有任何二进制直接调用 LDAP**（已逐个 objdump 核对）；LDAP 仅由
+  `libcurl` 的 `ldap://` 协议支持使用，而 VDI 客户端只走 https
+
+因此桩库只解决动态链接，不提供 LDAP 功能——在 VDI 场景下没有实际损失。
 
 ## 常见问题
 
@@ -162,16 +178,38 @@ Fedora 系走 dnf / rpm2cpio 路径取 OpenLDAP 2.4。
 **想窗口化而不是全屏显示远程桌面？**
 这是客户端自身行为（`vdi_session` 的显示参数），与本补丁无关。
 
+**Fedora 安装客户端用哪个包？**
+用官方 Ubuntu 的 `.deb`。**不要用 `alien` 转出来的 `.rpm`**：alien 会丢掉 deb 的
+`postinst`（真正的安装逻辑全在里面），并把依赖翻译成一堆 Fedora 上不存在的 soname，
+装上去只会得到"文件在 /opt 里、什么都没跑起来"的状态。正确做法是解出 deb 的数据
+（只写 `/opt/apps`、`/usr/share/icons`、`/usr/share/applications`，不覆盖系统文件），
+再执行 `postinst configure`。
+
+**Fedora 上 USB 重定向能用吗？**
+不能。客户端为 USB 重定向准备了预编译内核模块，但只覆盖 kylin 与 Ubuntu 5.4/5.10
+的内核；Fedora 内核版本不同，模块无法匹配（Fedora 自带 usbip 模块的模块名是
+`usbip_core`，与其预期不符）。桌面连接本身不受影响。可以在安装后停用它避免反复重启：
+
+```bash
+sudo systemctl disable --now vdi_usbipd
+```
+
+**Wayland 会话能用吗？**
+能。客户端是 Qt4/X11 程序，通过 XWayland 运行；实测 Fedora 45（默认 Wayland）下
+登录框正常显示。仅有一条 `QGtkStyle could not resolve GTK` 的无害提示。
+
 ## 已知限制
 
-- **只验证了 Debian 系（Linux Mint 22.3 / Ubuntu 24.04 用户空间，x86_64）**。Fedora 分支的
-  下载与解包逻辑已实现但未在真实 Fedora 上跑过，首次使用建议先 `diagnose` 再 `apply`。
+- **已验证环境**：Linux Mint 22.3（Ubuntu 24.04 用户空间）与 Fedora 45，均为 x86_64。
+  其他发行版应能工作但未逐一验证，首次使用建议先 `diagnose` 再 `apply`。
+- Fedora 上 USB 重定向不可用（见上）。
 - 如果系统里装了有缺陷的 Qt4（如 rock-core），补丁只是绕开它（RPATH 优先加载内置版本），
   不会卸载系统包；其他依赖该系统 Qt4 的程序仍可能受影响。
 - `libaudio2` 在新系统上通常会缺失，它是 Qt4 的 NAS 音频后端。补丁会补一份；下载失败不影响
   启动，只是多一条链接警告。
-- `ld.so.conf.d` 是本补丁唯一触及系统目录的改动。它只引入 `compat/ldso/`，其中 3 个 SONAME
+- `ld.so.conf.d` 是本补丁唯一触及系统目录的改动。它只引入 `compat/ldso/`，其中各个 SONAME
   在系统 ld.so 缓存中原本不存在，因此不改变任何现有程序的动态链接结果；`revert` 完整回滚。
+- 在某些系统上会退化为 LDAP 桩库，此时客户端不具备 LDAP 功能（VDI 场景用不到）。
 - 仅适配 glibc 系（Debian/Ubuntu/Fedora 等），不适用于 musl 发行版（Alpine 等）。
 - `--disable-idle-logout` 的 shim 与客户端版本绑定，升级后自动失效（回到厂商默认行为）。
 
@@ -198,6 +236,16 @@ Fedora 系走 dnf / rpm2cpio 路径取 OpenLDAP 2.4。
   以 `vdi_session.real -i <sessid> -s 0` 启动后持续运行，不再有 70ms 退出，
   X 窗口 `[<domain-uid> - <desk-name>] (Vdi Session)` 正常显示远程桌面画面
 - 系统侧抽查：`curl` 仍链接 `libldap.so.2`（2.6），未被兼容库替换
+
+在 Fedora Linux 45（Workstation，x86_64，kernel 7.2.15，Wayland 会话）上完整验证：
+
+- 用 deb 原生方式安装（解数据 + 跑 `postinst configure`），得到 `/usr/local/sangfor/vdiclient`、
+  三个 systemd 单元与桌面项；`alien` 转出的 RPM 因缺少 scriptlet 不可用
+- `apply` 后 `vdi_super_agent` 转为 active 并创建 `vdi_super_agent.sock`
+- `vdi_local_client` 在 Wayland/XWayland 下启动，登录框正常显示
+- 17 个二进制 `ldd` 无 `not found`；仅剩 OpenSSL 1.0 无版本表的无害提示
+- OpenLDAP 走桩库路径（Fedora 原生 2.4 无 `OPENLDAP_2.4_2` 版本定义）
+- USB 重定向不可用，已停用 `vdi_usbipd`（原因见上文）
 
 ### 空闲登出问题的排查与验证
 
