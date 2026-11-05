@@ -198,6 +198,34 @@ sudo systemctl disable --now vdi_usbipd
 能。客户端是 Qt4/X11 程序，通过 XWayland 运行；实测 Fedora 45（默认 Wayland）下
 登录框正常显示。仅有一条 `QGtkStyle could not resolve GTK` 的无害提示。
 
+**GNOME 的"全部应用"里找不到客户端？**
+客户端自带的 `.desktop` 有两个问题：末尾**没有换行符**，且 `Categories=Application;Development;`
+会让 GNOME 45+ 把它收进「开发」文件夹而不是顶层。重写为规范格式即可：
+
+```bash
+sudo tee /usr/share/applications/com.sangfor.vdi.desktop >/dev/null <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=VDI
+Name[zh_CN]=VDI 客户端
+Exec=/usr/local/sangfor/vdiclient/bin/vdi_local_client
+Icon=com.sangfor.vdi
+Terminal=false
+StartupNotify=true
+StartupWMClass=vdi_local_client.real
+Categories=Network;
+Keywords=vdi;sangfor;adesk;desktop;remote;桌面;远程;
+EOF
+sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor
+```
+
+**注意：GNOME 默认不在桌面上显示任何图标**（需要 Desktop Icons NG 扩展），所以要找的是
+"全部应用"或 Dock，而不是桌面。想固定到 Dock：右键图标 →「固定到 Dash」。
+
+**桌面图标？**
+本补丁不会创建桌面快捷方式。GNOME/Cinnamon 之外的发行版可用桌面项路径
+`/usr/share/applications/com.sangfor.vdi.desktop` 自行复制到桌面目录。
+
 ## 已知限制
 
 - **已验证环境**：Linux Mint 22.3（Ubuntu 24.04 用户空间）与 Fedora 45，均为 x86_64。
