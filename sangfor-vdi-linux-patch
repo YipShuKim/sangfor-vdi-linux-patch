@@ -845,6 +845,21 @@ write_wrapper() {
 # 由 sangfor-vdi-linux-patch 生成：加载兼容库后再启动原程序
 SANGFOR="/usr/local/sangfor/vdiclient"
 QT_PREFIX="/usr/local/Trolltech/Qt-4.8.7"
+
+# GNOME/Wayland 下 XWayland 只监听 unix socket，而客户端有时会把 DISPLAY 算成
+# "<本机IP>:0"（TCP），子进程会报 "cannot connect to X server <ip>"。这里兜底。
+if [ -S /tmp/.X11-unix/X0 ]; then
+    case "$DISPLAY" in
+        "" | :[0-9]*) : ;;
+        *) export DISPLAY=:0 ;;
+    esac
+fi
+if [ -z "$XAUTHORITY" ] || [ ! -r "$XAUTHORITY" ]; then
+    for f in /run/user/"$(id -u)"/.mutter-Xwaylandauth.* "$HOME"/.Xauthority; do
+        [ -r "$f" ] && { export XAUTHORITY="$f"; break; }
+    done
+fi
+
 LD_PATH=""
 for d in "$QT_PREFIX/lib" "$SANGFOR/compat" "$SANGFOR/lib"; do
     if [ -d "$d" ]; then
