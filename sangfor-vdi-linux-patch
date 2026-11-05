@@ -843,7 +843,9 @@ if [ -n "$LD_PATH" ]; then
         export LD_LIBRARY_PATH="$LD_PATH"
     fi
 fi
-exec "$SANGFOR/bin/__PROG__.real" "$@"
+# 用 exec -a 保留原始 argv[0]：部分发行版（如 Fedora 的 procps-ng）的 pidof
+# 按 argv[0] 匹配，若这里是 xxx.real，客户端自己的脚本会一直等不到进程。
+exec -a "$SANGFOR/bin/__PROG__" "$SANGFOR/bin/__PROG__.real" "$@"
 EOF
     # 可选功能 shim：只对 vdi_client 生效，且在库存在时才注入
     if [ "$OPT_NO_IDLE_LOGOUT" -eq 1 ] && shim_applies_to "$prog"; then
@@ -861,7 +863,7 @@ EOF
 )
         # 在 exec 行之前插入 shim 段
         awk -v block="$shim_block" '
-            /^exec "\$SANGFOR\/bin\// && !done { print block; done=1 }
+            /^exec (-a )?"\$SANGFOR\/bin\// && !done { print block; done=1 }
             { print }
         ' "$tmpf" > "$tmpf.new" && mv -f "$tmpf.new" "$tmpf"
         sed -i "s/__SHIMLIB__/$SHIM_LIB_NAME/" "$tmpf"
