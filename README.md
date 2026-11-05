@@ -49,6 +49,12 @@ sudo ./sangfor-vdi-fedora verify
 （只写 `/opt/apps` 与 `/usr/share/{applications,icons}`）→ 执行 deb 自带的 `postinst configure`
 → 处理 Fedora 上的兼容问题。只想装客户端时用 `sudo ./sangfor-vdi-fedora install --deb ...`。
 
+需要彻底移除时用 `sudo ./sangfor-vdi-fedora uninstall`：它会先停服务、结束客户端进程，
+把日志打包到 `/var/tmp/sangfor-vdi-logs-<时间>.tar.gz`，再按 postinst 的落盘清单删除
+客户端目录、图标、桌面项、udev 规则、cron 任务与服务单元（用户配置 `~/.config/sangfor` 保留）。
+**厂商自带的 `prerm`/`postrm` 实际上什么都不删**（检测到客户端没在跑就直接 `exit 0`），
+所以这一步只能由脚本自己完成。
+
 > **不要用 `alien` 转出来的 `.rpm`**：alien 会丢掉 deb 的 `postinst`（真正的安装逻辑全在里面），
 > 还会把依赖翻译成一堆 Fedora 上并不存在的 soname，装上去只会得到"文件在 `/opt` 里、
 > 什么都没跑起来"的状态。
@@ -128,7 +134,8 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 |---|---|
 | `install` | 只装客户端：找/解 deb、跑 `postinst`、装系统缺包 |
 | `apply` | 未安装则先安装，然后打全部兼容补丁 |
-| `diagnose` / `verify` / `revert` | 同上；`revert` **不卸载客户端** |
+| `uninstall` | 卸载客户端与补丁（停服务、杀进程、备份日志、清落盘清单） |
+| `diagnose` / `verify` / `revert` | 同上；`revert` **只撤销补丁、不卸载客户端** |
 
 额外选项：`--deb <文件>` 指定客户端 deb。
 
@@ -294,6 +301,8 @@ sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor
 - `ld.so.conf.d` 是唯一触及系统目录的改动，只引入 `compat/ldso/`，其中 SONAME 在系统
   ld.so 缓存中原本不存在，不改变任何现有程序的链接结果；`revert` 完整回滚。
 - 在无符号版本的 OpenLDAP 上会退化为桩库，此时客户端不具备 LDAP 功能（VDI 用不到）。
+- `uninstall` 只清系统侧文件；各用户的 `~/.config/sangfor`、浏览器证书库里的客户端证书
+  需要自行清理。
 - 仅适配 glibc 系（Debian/Ubuntu/Fedora 等），不适用于 musl 发行版（Alpine 等）。
 - 保活 shim 与客户端版本绑定，升级后自动失效（回到厂商默认行为）。
 

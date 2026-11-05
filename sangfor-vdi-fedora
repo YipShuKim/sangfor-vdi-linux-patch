@@ -1458,6 +1458,189 @@ do_revert() {
 }
 
 # ---------------------------------------------------------------------------
+# 卸载
+# ---------------------------------------------------------------------------
+# 厂商的 prerm/postrm 实际上什么都不删（检测到 vdi_tray 不在跑就直接 exit 0 走空），
+# 所以卸载只能按 postinst 的落盘清单自己清理。
+client_pids() {
+    local p c pid line t out=""
+    for p in /proc/[0-9]*/exe; do
+        t="$(readlink "$p" 2>/dev/null)" || continue
+        case "$t" in "$CLIENT_DIR"/*) ;; *) continue ;; esac
+        pid="${p#/proc/}"; pid="${pid%/exe}"
+        out="$out $pid"
+    done
+    # 包装脚本是 bash 进程，exe 指向 /bin/bash，只能按 argv[0] 前缀认
+    for c in /proc/[0-9]*/cmdline; do
+        [ -r "$c" ] || continue
+        line="$(tr '\0' ' ' < "$c" 2>/dev/null)" || continue
+        case "$line" in "$CLIENT_DIR"/bin/*) ;; *) continue ;; esac
+        pid="${c#/proc/}"; pid="${pid%/cmdline}"
+        out="$out $pid"
+    done
+    printf '%s\n' $out | sed '/^$/d' | sort -un
+}
+
+stop_client() {
+    local pids
+    if command -v systemctl >/dev/null 2>&1; then
+        run systemctl stop vdi_super_agent.service vdi_usbipd.service vdi_usbmagicd.service >/dev/null 2>&1 || true
+        run systemctl disable vdi_super_agent.service vdi_usbipd.service vdi_usbmagicd.service >/dev/null 2>&1 || true
+    fi
+    pids="$(client_pids)"
+    [ -n "$pids" ] || { ok "没有运行中的客户端进程"; return 0; }
+    info "结束客户端进程:$(printf ' %s' $pids)"
+    [ "$OPT_DRY_RUN" -eq 1 ] && return 0
+    kill $pids 2>/dev/null || true
+    sleep 2
+    pids="$(client_pids)"
+    if [ -n "$pids" ]; then
+        kill -9 $pids 2>/dev/null || true
+        sleep 1
+    fi
+    ok "客户端进程已结束"
+}
+
+backup_logs() {
+    local src="/var/log/sangfor/vdiclient" dst
+    [ -d "$src" ] || return 0
+    dst="/var/tmp/sangfor-vdi-logs-$(date +%Y%m%d-%H%M%S).tar.gz"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 备份日志到 $dst"
+        return 0
+    fi
+    if tar -czf "$dst" -C "$(dirname "$src")" "$(basename "$src")" 2>/dev/null; then
+        ok "日志已备份到 $dst"
+    else
+        warn "日志备份失败，仍继续删除"
+    fi
+}
+
+vendor_remove() {
+    local deb tmp
+    deb="$(find_client_deb 2>/dev/null)" || deb=""
+    if [ -z "$deb" ]; then
+        info "未找到客户端 deb，跳过厂商 prerm/postrm（它们本身也不删文件）"
+        return 0
+    fi
+    tmp="$(mktemp -d)"
+    if ! dpkg-deb -e "$deb" "$tmp/ctrl" 2>/dev/null; then
+        rm -rf "$tmp"
+        warn "解不出控制脚本，跳过 prerm/postrm"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 执行 prerm remove / postrm remove"
+        rm -rf "$tmp"
+        return 0
+    fi
+    ( cd "$tmp/ctrl" && bash ./prerm remove ) >/dev/null 2>&1 || true
+    ( cd "$tmp/ctrl" && bash ./postrm remove ) >/dev/null 2>&1 || true
+    rm -rf "$tmp"
+}
+
+remove_client_paths() {
+    local p
+    for p in \
+        "$CLIENT_DIR" \
+        /etc/sangfor \
+        /opt/apps/com.sangfor.vdi \
+        /opt/sangfor \
+        /run/sangfor \
+        /var/log/sangfor \
+        "$EXPECTED_QT_PREFIX" \
+        "$LDSO_CONF" \
+        /etc/logrotate.d/vdi_session.conf \
+        /etc/udev/rules.d/90-jitusb.rules \
+        /etc/cron.d/vditimingtask \
+        /usr/share/applications/com.sangfor.vdi.desktop \
+        /etc/systemd/system/vdi_super_agent.service.d \
+        /etc/systemd/system/vdi_usbipd.service.d \
+        /etc/systemd/system/vdi_usbmagicd.service.d \
+        /usr/lib/systemd/system/vdi_super_agent.service \
+        /usr/lib/systemd/system/vdi_usbipd.service \
+        /usr/lib/systemd/system/vdi_usbmagicd.service \
+        /etc/systemd/system/vdi_super_agent.service \
+        /etc/systemd/system/vdi_usbipd.service \
+        /etc/systemd/system/vdi_usbmagicd.service \
+        /etc/xdg/autostart/vdi-autostart.desktop \
+        /etc/xdg/autostart/vdi-compton.desktop \
+        /etc/xdg/autostart/vdi-marco.desktop; do
+        [ -e "$p" ] || continue
+        run rm -rf "$p"
+    done
+    for p in /usr/share/icons/hicolor/*/apps/com.sangfor.vdi.png; do
+        [ -e "$p" ] || continue
+        run rm -f "$p"
+    done
+    # 客户端/补丁留下的空壳父目录（rmdir 只在为空时成功，不会动到其他程序）
+    for p in "$(dirname "$CLIENT_DIR")" "$(dirname "$EXPECTED_QT_PREFIX")" /opt/apps; do
+        [ -d "$p" ] || continue
+        run rmdir "$p" 2>/dev/null || true
+    done
+}
+
+do_uninstall() {
+    detect_platform
+    need_root
+    log "sangfor-vdi-fedora $PATCH_VERSION"
+    log "系统: $OS_NAME ${OS_VER} (${OS_ID:-?})"
+    if [ ! -d "$CLIENT_DIR" ]; then
+        warn "未发现 $CLIENT_DIR，将清理残留文件"
+    fi
+    log ""
+    log "将停止并删除："
+    log "  - 服务 vdi_super_agent / vdi_usbipd / vdi_usbmagicd"
+    log "  - 目录 $CLIENT_DIR、/etc/sangfor、/opt/apps/com.sangfor.vdi、/opt/sangfor"
+    log "  - 日志 /var/log/sangfor（先打包到 /var/tmp）"
+    log "  - 补丁相关的 $EXPECTED_QT_PREFIX 与 $LDSO_CONF"
+    log "  - 桌面项、图标、udev 规则、logrotate、cron 任务、服务单元"
+    log "  系统软件包不会被改动；用户级配置 ~/.config/sangfor 保留。"
+    [ "$OPT_DRY_RUN" -eq 1 ] || confirm "确认卸载？" || exit 0
+
+    stop_client
+    backup_logs
+    vendor_remove
+    remove_client_paths
+
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules >/dev/null 2>&1 || true
+        fi
+        if command -v ldconfig >/dev/null 2>&1; then
+            ldconfig 2>/dev/null || true
+        fi
+    fi
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log ""
+        log "[dry-run] 上面是将执行的动作，未改动任何文件"
+        return 0
+    fi
+
+    log ""
+    local left=0 p
+    for p in "$CLIENT_DIR" /etc/sangfor /opt/apps/com.sangfor.vdi /opt/sangfor "$EXPECTED_QT_PREFIX"; do
+        [ -e "$p" ] && { warn "仍有残留: $p"; left=$((left + 1)); }
+    done
+    if [ "$OPT_DRY_RUN" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files 2>/dev/null | grep -qE '^(vdi_super_agent|vdi_usbipd|vdi_usbmagicd)\.service'; then
+            warn "服务单元仍有残留"
+            left=$((left + 1))
+        fi
+    fi
+    if [ "$left" -eq 0 ]; then
+        ok "卸载完成，无残留"
+    else
+        warn "有 $left 处残留，请检查上面的提示"
+    fi
+    return "$left"
+}
+
+# ---------------------------------------------------------------------------
 # 诊断
 # ---------------------------------------------------------------------------
 do_diagnose() {
@@ -1560,6 +1743,7 @@ sangfor-vdi-fedora $PATCH_VERSION
   diagnose   查看环境与各项依赖状态（只读）
   verify     验证补丁结果
   revert     撤销补丁（不卸载客户端）
+  uninstall  卸载客户端（先备份日志；厂商 prerm/postrm 实际不删文件）
 
 选项:
   --deb <文件>     客户端 deb 路径（默认在 当前目录 / ~/下载 / ~/Downloads / /tmp 里找）
@@ -1584,6 +1768,7 @@ sangfor-vdi-fedora $PATCH_VERSION
   sudo ./sangfor-vdi-fedora apply --deb ~/下载/vdi-linux-client-x86_64-ubuntu.deb
   sudo ./sangfor-vdi-fedora diagnose
   sudo ./sangfor-vdi-fedora verify
+  sudo ./sangfor-vdi-fedora uninstall -y
 EOF
 }
 
@@ -1591,7 +1776,7 @@ main() {
     local cmd=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            install|diagnose|apply|verify|revert) [ -z "$cmd" ] && cmd="$1" ;;
+            install|diagnose|apply|verify|revert|uninstall) [ -z "$cmd" ] && cmd="$1" ;;
             --deb) shift; [ $# -gt 0 ] || { err "--deb 需要一个文件路径"; exit 2; }
                    OPT_DEB="$1" ;;
             --deb=*) OPT_DEB="${1#--deb=}" ;;
@@ -1610,11 +1795,12 @@ main() {
     done
     [ -z "$cmd" ] && { usage; exit 2; }
     case "$cmd" in
-        install)  do_install ;;
-        diagnose) do_diagnose ;;
-        apply)    do_apply ;;
-        verify)   do_verify ;;
-        revert)   do_revert ;;
+        install)   do_install ;;
+        diagnose)  do_diagnose ;;
+        apply)     do_apply ;;
+        verify)    do_verify ;;
+        revert)    do_revert ;;
+        uninstall) do_uninstall ;;
     esac
 }
 
