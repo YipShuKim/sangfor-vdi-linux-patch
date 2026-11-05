@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+#
+# sangfor-vdi-keepalive
+#
+# 关闭深信服 VDI 客户端 vdi_client 的 20 分钟固定计时登出。
+#
+# 背景（实测结论）：
+#   - 客户端读取服务端下发的 NoInputTimeout，值 > 0 就进入固定计时循环，到期主动 logout
+#   - 计时起点只在进入循环时记录一次，循环中从不更新；实测 1200.011s / 1200.499s，
+#     没有任何重置迹象
+#   - 它不响应真实输入：把用户加进 input 组让进程能读 /dev/input 无效，向 /dev/input
+#     注入 inotify 事件也无效
+#   - 远程桌面下键盘鼠标走 SPICE 通道直达虚拟机，本机根本不会产生输入事件 → 必然误踢
+#
+# 做法：编译一个 LD_PRELOAD 小库，只拦截“解析 NoInputTimeout 的那一次 atoi”
+# （按返回地址偏移 0xd2ca8 精确匹配），让它返回 0，客户端便跳过计时循环；进程内其余
+# atoi 原样透传。库只注入 bin/vdi_client 的启动包装脚本，其它可执行文件不受影响。
+#
+# 前置条件：客户端已安装，且已经跑过主补丁（sangfor-vdi-ubuntu / sangfor-vdi-fedora）
+# 的 apply —— 它会把 bin/ 下的原生二进制改成包装脚本 + .real，本补丁才有着力点。
+#
+# 用法：
+#   sudo ./sangfor-vdi-keepalive apply     # 编译 shim 并注入（需重启客户端生效）
+#   sudo ./sangfor-vdi-keepalive verify    # 检查当前状态
+#   sudo ./sangfor-vdi-keepalive revert    # 撤销（删 shim + 去掉注入）
+#
+# 合规提示：这样做会让“无人看管时自动锁屏/断连”的安全策略失效，请先确认所在机构的规定。
+# 更合规的做法是让管理员在 VDC 控制台把该策略值调大或关掉。
+
+set -o pipefail
+
+PATCH_VERSION="2.0"
+
+CLIENT_DIR="/usr/local/sangfor/vdiclient"
+BIN_DIR="$CLIENT_DIR/bin"
+SHIM_DIR="$CLIENT_DIR/compat/shim"
+SHIM_LIB="$SHIM_DIR/libnoinput_timeout.so"
+SRC_NAME="noinput_timeout.c"
+
+# shim 的字节偏移只在这个客户端版本上验证过；版本不符时仍可部署，只会不命中
+EXPECTED_VERSION="5.9.6.2154"
+
+BLOCK_BEGIN="# >>> sangfor-vdi-keepalive"
+BLOCK_END="# <<< sangfor-vdi-keepalive"
+
+OPT_DRY_RUN=0
+OPT_VERBOSE=0
+
+C_RED="" C_GRN="" C_YEL="" C_BLU="" C_RST=""
+if [ -t 1 ]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_BLU=$'\033[34m'; C_RST=$'\033[0m'
+fi
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s[*]%s %s\n' "$C_BLU" "$C_RST" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*"; }
+err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+dbg()  { [ "$OPT_VERBOSE" -eq 1 ] && printf '[D] %s\n' "$*"; return 0; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || die "需要 root 权限，请用 sudo 运行。"
+}
+
+run() {
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'; printf ' %q' "$@"; printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+is_elf() { head -c 4 "$1" 2>/dev/null | grep -q $'\x7fELF'; }
+
+shim_source_dir() {
+    local d
+    for d in "$(dirname "$(readlink -f "$0")")/shim" "./shim"; do
+        [ -f "$d/$SRC_NAME" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+client_version() {
+    local f="$CLIENT_DIR/version"
+    [ -f "$f" ] && { head -c 64 "$f" | tr -dc '0-9.'; return; }
+    return 0
+}
+
+# 包装脚本由主补丁生成；直接判 ELF 比猜文件名可靠
+check_wrapper() {
+    local vc="$BIN_DIR/vdi_client"
+    [ -d "$CLIENT_DIR" ] || die "未找到 $CLIENT_DIR，请先安装 VDI 客户端"
+    [ -f "$vc" ] || die "未找到 $vc"
+    if is_elf "$vc"; then
+        die "bin/vdi_client 还是原生二进制，没有启动包装脚本。
+请先运行主补丁的 apply（./sangfor-vdi-ubuntu apply 或 ./sangfor-vdi-fedora apply），
+再运行本补丁。"
+    fi
+    head -1 "$vc" 2>/dev/null | grep -q '^#!/bin/bash' \
+        || die "bin/vdi_client 既不是 ELF 也不是 bash 包装脚本，无法注入。"
+}
+
+build_shim() {
+    local src cc
+    src="$(shim_source_dir)" || die "找不到 shim 源码 $SRC_NAME（应与本脚本同级的 shim/ 目录）"
+    cc="$(command -v cc || command -v gcc || true)"
+    [ -n "$cc" ] || die "未找到 C 编译器，请先安装 gcc"
+    run mkdir -p "$SHIM_DIR"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] $cc -shared -fPIC -O2 -o $SHIM_LIB $src/$SRC_NAME -ldl"
+        return 0
+    fi
+    if ! "$cc" -shared -fPIC -O2 -Wall -o "$SHIM_LIB" "$src/$SRC_NAME" -ldl; then
+        die "shim 编译失败"
+    fi
+    chown 0:0 "$SHIM_LIB" 2>/dev/null || true
+    chmod 644 "$SHIM_LIB"
+    ok "shim 已编译: $SHIM_LIB"
+}
+
+# 注入点紧跟 shebang，不依赖包装脚本的具体内容
+inject_block() {
+    local vc="$BIN_DIR/vdi_client" block tmp
+    if grep -qF "$BLOCK_BEGIN" "$vc" 2>/dev/null; then
+        ok "已注入过，跳过（vdi_client）"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 向 $vc 注入 LD_PRELOAD 段"
+        return 0
+    fi
+    block="$(mktemp)"
+    tmp="$(mktemp "$BIN_DIR/.keepalive.XXXXXX")"
+    cat > "$block" <<EOF
+$BLOCK_BEGIN
+# 由 sangfor-vdi-keepalive 维护：让 vdi_client 跳过固定计时登出；撤销请改用本脚本 revert
+KEEPALIVE_SHIM="$SHIM_LIB"
+if [ -f "\$KEEPALIVE_SHIM" ]; then
+    if [ -n "\$LD_PRELOAD" ]; then
+        export LD_PRELOAD="\$KEEPALIVE_SHIM:\$LD_PRELOAD"
+    else
+        export LD_PRELOAD="\$KEEPALIVE_SHIM"
+    fi
+fi
+$BLOCK_END
+EOF
+    { head -1 "$vc"; cat "$block"; tail -n +2 "$vc"; } > "$tmp"
+    chmod --reference="$vc" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+    chown 0:0 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$vc"
+    rm -f "$block"
+    ok "已向 vdi_client 启动包装注入 LD_PRELOAD"
+}
+
+remove_block() {
+    local vc="$BIN_DIR/vdi_client" tmp
+    [ -f "$vc" ] || return 0
+    grep -qF "$BLOCK_BEGIN" "$vc" 2>/dev/null || { info "包装脚本里没有注入记录"; return 0; }
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 从 $vc 移除 LD_PRELOAD 段"
+        return 0
+    fi
+    tmp="$(mktemp "$BIN_DIR/.keepalive.XXXXXX")"
+    sed "/^$BLOCK_BEGIN/,/^$BLOCK_END/d" "$vc" > "$tmp"
+    chmod --reference="$vc" "$tmp" 2>/dev/null || chmod 755 "$tmp"
+    chown 0:0 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$vc"
+    ok "已从 vdi_client 启动包装移除 LD_PRELOAD"
+}
+
+do_apply() {
+    need_root
+    log "sangfor-vdi-keepalive $PATCH_VERSION"
+    check_wrapper
+
+    local ver
+    ver="$(client_version)"
+    if [ -n "$ver" ] && [ "$ver" != "$EXPECTED_VERSION" ]; then
+        warn "客户端版本为 $ver，而 shim 仅在 $EXPECTED_VERSION 上验证过偏移。"
+        warn "仍会部署：偏移不符时 shim 不会命中，客户端行为回到厂商默认（不会更糟）。"
+    fi
+
+    build_shim
+    inject_block
+
+    log ""
+    ok "保活已启用（只作用于 vdi_client）"
+    info "需要重启客户端才生效：退出 VDI 客户端，再从应用菜单重新打开。"
+    info "已在运行的客户端不受影响（当前会话仍按原计时登出）。"
+}
+
+do_verify() {
+    local rc=0 vc="$BIN_DIR/vdi_client" n pid unloaded=0
+
+    if [ -f "$SHIM_LIB" ]; then
+        ok "shim 已编译: $SHIM_LIB"
+    else
+        err "shim 不存在: $SHIM_LIB（先运行 apply）"
+        rc=1
+    fi
+
+    if [ -f "$vc" ] && grep -qF "$BLOCK_BEGIN" "$vc" 2>/dev/null; then
+        ok "vdi_client 启动包装已注入 LD_PRELOAD"
+    else
+        err "vdi_client 启动包装未注入"
+        rc=1
+    fi
+
+    n="$(grep -lxF "$BLOCK_BEGIN" "$BIN_DIR"/* 2>/dev/null | wc -l)"
+    if [ "${n:-0}" -le 1 ]; then
+        ok "注入范围正常（仅 vdi_client）"
+    else
+        warn "有 $n 个文件被注入，预期只有 vdi_client"
+        rc=1
+    fi
+
+    # 运行中的 vdi_client 是否真的加载了 shim（需要 root 才能读 environ）
+    local d cmdline
+    for d in /proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        cmdline="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+        case "$cmdline" in
+            "$BIN_DIR/vdi_client "*|"$BIN_DIR/vdi_client") : ;;
+            *) continue ;;
+        esac
+        pid="${d#/proc/}"
+        if grep -qa "libnoinput_timeout" "$d/environ" 2>/dev/null; then
+            ok "运行中的 vdi_client（pid $pid）已加载 shim"
+        else
+            unloaded=$((unloaded + 1))
+            warn "运行中的 vdi_client（pid $pid）未加载 shim —— 重启客户端后生效"
+        fi
+    done
+    [ "$unloaded" -gt 0 ] && dbg "pending restart: $unloaded"
+    return "$rc"
+}
+
+do_revert() {
+    need_root
+    log "将撤销保活："
+    log "  - 从 $BIN_DIR/vdi_client 移除 LD_PRELOAD 段"
+    log "  - 删除 $SHIM_LIB"
+    remove_block
+    run rm -f "$SHIM_LIB"
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        rmdir "$SHIM_DIR" 2>/dev/null || true
+    fi
+    ok "已撤销（重启客户端后回到厂商默认的 20 分钟登出）"
+}
+
+usage() {
+    cat <<EOF
+sangfor-vdi-keepalive $PATCH_VERSION
+
+关闭深信服 VDI 客户端的 20 分钟固定计时登出（独立补丁，适用于所有发行版）。
+
+用法: $(basename "$0") <命令> [选项]
+
+命令:
+  apply     编译 shim 并注入 vdi_client 的启动包装脚本（需重启客户端生效）
+  verify    检查 shim、注入范围，以及运行中的客户端是否已加载
+  revert    移除注入并删除 shim
+
+选项:
+  --dry-run    只打印将执行的操作
+  -v, --verbose 输出调试信息
+  -h, --help   显示帮助
+
+前置条件:
+  - 客户端已安装
+  - 已运行主补丁 apply（sangfor-vdi-ubuntu apply / sangfor-vdi-fedora apply）
+
+合规提示:
+  本补丁会让客户端的空闲自动登出不再生效，属于对厂商安全设计的改动。
+  启用前请确认符合所在机构的规定；更合规的做法是让管理员在 VDC 控制台调整该策略。
+
+示例:
+  sudo ./sangfor-vdi-keepalive apply
+  sudo ./sangfor-vdi-keepalive verify
+  sudo ./sangfor-vdi-keepalive revert
+EOF
+}
+
+main() {
+    local cmd=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            apply|verify|revert) [ -z "$cmd" ] && cmd="$1" ;;
+            --dry-run) OPT_DRY_RUN=1 ;;
+            -v|--verbose) OPT_VERBOSE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) err "未知参数: $1"; usage; exit 2 ;;
+        esac
+        shift
+    done
+    [ -z "$cmd" ] && { usage; exit 2; }
+    case "$cmd" in
+        apply)  do_apply ;;
+        verify) do_verify ;;
+        revert) do_revert ;;
+    esac
+}
+
+main "$@"

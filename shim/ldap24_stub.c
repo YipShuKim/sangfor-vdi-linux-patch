@@ -1,5 +1,5 @@
 /*
- * ldap24_stub —— 由 sangfor-vdi-linux-patch 生成（仅在现代发行版上兜底使用）
+ * ldap24_stub —— 由 sangfor-vdi-fedora 编译（仅在真实 OpenLDAP 2.4 不可用时兜底）
  *
  * 为什么需要
  * ---------

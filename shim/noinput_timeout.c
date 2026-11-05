@@ -1,5 +1,5 @@
 /*
- * noinput-timeout-shim —— 由 sangfor-vdi-linux-patch 的可选功能 --disable-idle-logout 生成
+ * noinput-timeout-shim —— 由 sangfor-vdi-keepalive 编译并注入（独立保活补丁）
  *
  * 背景
  * ----
