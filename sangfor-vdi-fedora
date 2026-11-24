@@ -20,6 +20,7 @@
 #      - vdi_webui_agent.sh 用 pidof 判前置进程，Fedora 的 procps-ng 按 argv[0]
 #        匹配，包装脚本执行 xxx.real 会让它一直等
 #      - postinst 留下的 is_installing_depend 标记让客户端误判依赖缺失
+#      - 图形会话比补丁早建立时 vdi_webui_agent 不会自己出现（登录报"登录异常"）
 #      - DISPLAY 被算成 "<本机IP>:0"（TCP），而 XWayland 只监听 unix socket
 #
 # 安装前请准备官方 Ubuntu 客户端包（vdi-linux-client-x86_64-ubuntu.deb 或
@@ -1225,6 +1226,112 @@ post_install_cleanup() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 运行态：vdi_webui_agent（登录异常的直接原因）
+# ---------------------------------------------------------------------------
+# 客户端登录前的所有请求都发往 127.0.0.1:31113，由 vdi_webui_agent 提供。
+# 它只在「图形登录」时由 /etc/xdg/autostart/vdi-autostart.desktop 拉起，而
+# vdi_webui_agent.sh 又要先等到 pidof vdi_super_agent 成功才继续。于是有两种
+# 空窗期：补丁刚打完、图形会话却建立得比补丁早（autostart 早已跑过），以及
+# 旧包装脚本让 pidof 永远失败。两种都表现为客户端提示
+# 「登录异常,请检查网络和服务器地址」——那句提示与网络无关，真正原因是本地
+# 31113 没有监听。下面在 apply 末尾把这一环补上。
+WEBUI_PORT_FILE="/run/sangfor/vdiclient/vdi_webui_agent.listen_port"
+
+webui_agent_listening() {
+    [ -s "$WEBUI_PORT_FILE" ] || return 1
+    if command -v ss >/dev/null 2>&1; then
+        pipe_match '127\.0\.0\.1:31113' ss -ltn
+        return $?
+    fi
+    # 没有 ss 时退化为「端口文件存在 + 进程在」的粗略判断
+    pgrep -x vdi_webui_agent >/dev/null 2>&1
+}
+
+# 取一个活动图形会话的用户与其 DISPLAY/XAUTHORITY。
+# 这两个值从该用户进程的 /proc/<pid>/environ 里取：Wayland 下 XAUTHORITY 是
+# /run/user/<uid>/.mutter-Xwaylandauth.XXXXXX 这种随机文件名，loginctl 拿不到。
+graphical_session_env() {
+    command -v loginctl >/dev/null 2>&1 || return 1
+    local sid f2 f3 uid user pid envf disp auth
+    while read -r sid f2 f3 _rest; do
+        [ -n "${sid:-}" ] || continue
+        # 老版本 loginctl 输出 "ID USER SEAT TTY"（无 UID 列），新版本带 UID
+        case "$f2" in
+            ''|*[!0-9]*) user="$f2"; uid="$(id -u "$f2" 2>/dev/null)" ;;
+            *)           uid="$f2"; user="$f3" ;;
+        esac
+        [ -n "${user:-}" ] && [ -n "${uid:-}" ] || continue
+        [ "$uid" -ge 1000 ] 2>/dev/null || continue
+        [ "$(loginctl show-session "$sid" -p Active --value 2>/dev/null)" = "yes" ] || continue
+        case "$(loginctl show-session "$sid" -p Type --value 2>/dev/null)" in
+            x11|wayland) ;;
+            *) continue ;;
+        esac
+        for pid in $(pgrep -u "$user" 2>/dev/null); do
+            envf="/proc/$pid/environ"
+            [ -r "$envf" ] || continue
+            disp="$(tr '\0' '\n' <"$envf" 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -n1)"
+            [ -n "$disp" ] || continue
+            auth="$(tr '\0' '\n' <"$envf" 2>/dev/null | sed -n 's/^XAUTHORITY=//p' | head -n1)"
+            printf '%s\t%s\t%s\n' "$user" "$disp" "$auth"
+            return 0
+        done
+    done <<<"$(loginctl list-sessions --no-legend 2>/dev/null)"
+    return 1
+}
+
+start_webui_agent_for() {
+    local user="$1" disp="$2" auth="$3" sh="$BIN_DIR/vdi_webui_agent.sh" i
+    [ -x "$sh" ] || { warn "缺少 $sh，无法拉起 vdi_webui_agent"; return 1; }
+    # 上一轮遗留的等待循环/看门狗先清掉，避免两份 softdog 互相 killall
+    pkill -u "$user" -f "$BIN_DIR/webui_agent_softdog.sh" 2>/dev/null || true
+    pkill -u "$user" -f "$BIN_DIR/vdi_webui_agent.sh" 2>/dev/null || true
+    pkill -u "$user" -x vdi_webui_agent 2>/dev/null || true
+    sleep 1
+    local -a envs=("DISPLAY=$disp")
+    [ -n "$auth" ] && envs+=("XAUTHORITY=$auth")
+    if command -v runuser >/dev/null 2>&1; then
+        # setsid -f：脱离当前会话/终端，apply 退出后 agent 继续由 softdog 守护
+        runuser -u "$user" -- setsid -f env "${envs[@]}" "$sh" >/dev/null 2>&1 </dev/null || true
+    else
+        warn "缺少 runuser（util-linux），无法切换到用户 $user 启动 agent"
+        return 1
+    fi
+    # agent 由 softdog 每 5 秒拉一次，留足余量
+    for i in $(seq 1 30); do
+        sleep 0.5
+        webui_agent_listening && return 0
+    done
+    return 1
+}
+
+ensure_webui_agent() {
+    if webui_agent_listening; then
+        ok "vdi_webui_agent 已在监听 127.0.0.1:31113"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 若 vdi_webui_agent 未监听 127.0.0.1:31113，会按登录用户拉起 $BIN_DIR/vdi_webui_agent.sh"
+        return 0
+    fi
+    local sess user disp auth
+    sess="$(graphical_session_env 2>/dev/null)" || true
+    if [ -z "$sess" ]; then
+        warn "未发现活动图形会话，无法代为拉起 vdi_webui_agent；下次图形登录会由 vdi-autostart 拉起"
+        return 0
+    fi
+    IFS=$'\t' read -r user disp auth <<<"$sess"
+    info "为图形会话用户 $user 拉起 vdi_webui_agent（DISPLAY=$disp）..."
+    if start_webui_agent_for "$user" "$disp" "$auth"; then
+        ok "vdi_webui_agent 已就绪（127.0.0.1:31113）"
+        return 0
+    fi
+    warn "vdi_webui_agent 15 秒内未监听 127.0.0.1:31113，登录仍会报「登录异常」"
+    warn "排查: tail /var/log/sangfor/vdiclient/vdi_webui_agent.log"
+    return 1
+}
+
 # 用官方 Ubuntu deb 安装客户端（不走 alien）
 install_client_from_deb() {
     local deb tmp
@@ -1305,6 +1412,8 @@ do_apply() {
         fi
     fi
 
+    # 31113 没人监听时，登录会报「登录异常,请检查网络和服务器地址」（与网络无关）
+    ensure_webui_agent || FAILED=$((FAILED + 1))
     log ""
     if [ "$FAILED" -eq 0 ]; then
         ok "补丁应用完成。现在从应用菜单点 VDI 即可（或执行 $BIN_DIR/vdi_local_client）"
@@ -1369,6 +1478,16 @@ do_verify() {
         else
             info "vdi_super_agent 当前未运行（登录时会由 vdi_update 拉起）"
         fi
+    fi
+
+    if webui_agent_listening; then
+        ok "vdi_webui_agent 已监听 127.0.0.1:31113"
+    elif [ -n "$(graphical_session_env 2>/dev/null)" ]; then
+        warn "vdi_webui_agent 未监听 127.0.0.1:31113，登录会报「登录异常,请检查网络和服务器地址」"
+        warn "修复: 重跑 apply，或在图形会话里执行 $BIN_DIR/vdi_webui_agent.sh"
+        rc=1
+    else
+        info "无活动图形会话，跳过 vdi_webui_agent 检查"
     fi
 
     local real_count
