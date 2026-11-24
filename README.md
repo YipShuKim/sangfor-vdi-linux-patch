@@ -47,7 +47,9 @@ sudo ./sangfor-vdi-fedora verify
 
 `apply` 会依次：装系统缺的包（`dpkg`/`gcc`/`binutils`/`librtmp` 等）→ 解 deb 数据段
 （只写 `/opt/apps` 与 `/usr/share/{applications,icons}`）→ 执行 deb 自带的 `postinst configure`
-→ 处理 Fedora 上的兼容问题。只想装客户端时用 `sudo ./sangfor-vdi-fedora install --deb ...`。
+→ 处理 Fedora 上的兼容问题 → 若当前有图形会话，最后把 `vdi_super_agent` 与
+`vdi_webui_agent` 真正拉起来并核对 `127.0.0.1:31113` 是否在监听。只想装客户端时用
+`sudo ./sangfor-vdi-fedora install --deb ...`。
 
 需要彻底移除时用 `sudo ./sangfor-vdi-fedora uninstall`：它会先停服务、结束客户端进程，
 把日志打包到 `/var/tmp/sangfor-vdi-logs-<时间>.tar.gz`，再按 postinst 的落盘清单删除
@@ -94,6 +96,7 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 | `pidof` 匹配不到 `vdi_super_agent` | `vdi_webui_agent.sh` 用 `pidof vdi_super_agent` 判前置进程；Fedora 的 procps-ng 按 `argv[0]` 匹配，包装脚本执行 `xxx.real` 就永远等不到 | 包装脚本用 `exec -a` 保留原始 `argv[0]` |
 | `is_installing_depend` 残留 | `postinst` 创建该标记，正常由 `install_depend.sh` 完成后删除；该脚本只认 Ubuntu/Kylin/UOS，在 Fedora 上永远不删。客户端读到此文件就认为依赖不完整（`CHECK_VER` 返回 `success:false`，日志 `client update! quit client and wait to start`） | 依赖齐备后自动清除 |
 | `DISPLAY` 被算成 `<本机IP>:0` | GNOME 的 XWayland 只监听 unix socket，TCP 形式连不上 → `vdi_tray: cannot connect to X server <ip>` → 托盘死 → 客户端判定 `Session start process was canceled` 并退回资源列表 | 包装脚本检测到 `/tmp/.X11-unix/X0` 时把 IP 形式改写成 `:0`，并补 `XAUTHORITY=/run/user/<uid>/.mutter-Xwaylandauth.*` |
+| `vdi_webui_agent` 不在跑，登录报「登录异常,请检查网络和服务器地址」 | 登录前请求都发往 `127.0.0.1:31113`，而该 agent 只在图形登录时由 `vdi-autostart` 拉起。补丁刚打完、图形会话却建立得比补丁早时，autostart 早已跑过，agent 不会自己出现（`apply` 原本只重启 `vdi_super_agent`） | `apply` 末尾检测 31113 是否在监听，没有就按活动图形会话的 `DISPLAY`/`XAUTHORITY` 以该用户拉起 `vdi_webui_agent.sh`；`verify` 也会一起检查 |
 
 ### `sangfor-vdi-keepalive`：关掉 20 分钟固定计时登出
 
@@ -133,7 +136,7 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 | `sangfor-vdi-fedora` | 作用 |
 |---|---|
 | `install` | 只装客户端：找/解 deb、跑 `postinst`、装系统缺包 |
-| `apply` | 未安装则先安装，然后打全部兼容补丁 |
+| `apply` | 未安装则先安装，然后打全部兼容补丁；最后按活动图形会话拉起 `vdi_super_agent` 与 `vdi_webui_agent`（幂等） |
 | `uninstall` | 卸载客户端与补丁（停服务、杀进程、备份日志、清落盘清单） |
 | `diagnose` / `verify` / `revert` | 同上；`revert` **只撤销补丁、不卸载客户端** |
 
@@ -242,12 +245,16 @@ sudo systemctl disable --now vdi_usbipd
 显示。仅有一条 `QGtkStyle could not resolve GTK` 的无害提示。
 
 **登录时报"登录异常，请检查网络和服务器地址"？**
-这个提示名不副实，实际与网络无关。两个已确认的原因：
+这个提示名不副实，实际与网络无关：登录前的请求都发往 `127.0.0.1:31113`，那是本地
+`vdi_webui_agent` 提供的服务，它不在就报这句。两个已确认的原因：
 
-1. **`vdi_webui_agent` 没起来**（登录前的请求都发往 `127.0.0.1:31113`）。它由
-   `vdi_webui_agent.sh` 拉起，而该脚本用 `pidof vdi_super_agent` 判断前置进程；Fedora 的
-   procps-ng 按 `argv[0]` 匹配，包装脚本执行 `xxx.real` 就找不到。自查：
+1. **`vdi_webui_agent` 没起来**。它由 `vdi_webui_agent.sh` 拉起，而该脚本用
+   `pidof vdi_super_agent` 判断前置进程；Fedora 的 procps-ng 按 `argv[0]` 匹配，
+   包装脚本执行 `xxx.real` 就找不到。包装脚本现在用 `exec -a` 保留 `argv[0]`，
+   **并且 `apply` 末尾会检测 31113 有没有监听，没有就按当前图形会话的用户主动拉起**
+   ——这样"补丁刚打完、图形会话却建立得比补丁早"造成的空窗期也不会漏。自查：
    `pidof vdi_super_agent && cat /run/sangfor/vdiclient/vdi_webui_agent.listen_port`
+   仍为空时手动拉一次：`/usr/local/sangfor/vdiclient/bin/vdi_webui_agent.sh &`
 2. **`/etc/sangfor/vdiclient/is_installing_depend` 残留**。见上表，`sangfor-vdi-fedora`
    在依赖齐备后会自动清除。
 
