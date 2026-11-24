@@ -749,6 +749,29 @@ is_patch_wrapper() {
     grep -qE 'exec .*/bin/[^/"]+\.real' "$1" 2>/dev/null
 }
 
+# sangfor-vdi-keepalive 往包装脚本里插的那段（LD_PRELOAD 注入）。
+# 本补丁会重建 $BIN_DIR 下全部包装脚本，重建前要把它原样取出、重建后放回，
+# 否则重跑一次主补丁就把保活抹掉——表现为"明明开着保活还是 20 分钟准时登出"。
+KEEPALIVE_BEGIN="# >>> sangfor-vdi-keepalive"
+KEEPALIVE_END="# <<< sangfor-vdi-keepalive"
+
+keepalive_block() {
+    local b="$KEEPALIVE_BEGIN" e="$KEEPALIVE_END"
+    sed -n "/^${b}\$/,/^${e}\$/p" "$1" 2>/dev/null
+}
+
+inject_keepalive() {
+    local target="$1" block="$2" tmpf
+    [ -n "$block" ] && [ -f "$target" ] || return 0
+    grep -qxF "$KEEPALIVE_BEGIN" "$target" 2>/dev/null && return 0
+    tmpf="$(mktemp "$BIN_DIR/.keepalive.XXXXXX")" || return 1
+    # 注入位置与 sangfor-vdi-keepalive 保持一致：紧跟 shebang 之后
+    { head -n 1 "$target"; printf '%s\n' "$block"; tail -n +2 "$target"; } >"$tmpf"
+    chmod 755 "$tmpf"
+    mv -f "$tmpf" "$target"
+    chown 0:0 "$target" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -1123,6 +1146,7 @@ apply_qt() {
 
 apply_wrappers() {
     local f count=0
+    local ka_prog="" ka_block=""
     # 先把已包装的原件安全还原，保证重跑时一定拿到原生 ELF 再重新包装
     for f in "$BIN_DIR"/*.real; do
         [ -f "$f" ] || continue
@@ -1130,7 +1154,15 @@ apply_wrappers() {
         if [ ! -f "$wrap" ]; then
             run mv -f "$f" "$wrap"
         elif is_patch_wrapper "$wrap"; then
-            # 占位是包装脚本：删掉它，把原始 ELF 放回原文件名，稍后重新包装
+            # 占位是包装脚本：删掉它，把原始 ELF 放回原文件名，稍后重新包装。
+            # 它身上可能还带着 sangfor-vdi-keepalive 的 LD_PRELOAD 注入，
+            # 重建前先原样存下来，否则这一次 apply 就把保活抹掉了。
+            local blk
+            blk="$(keepalive_block "$wrap")"
+            if [ -n "$blk" ]; then
+                ka_prog="$(basename "$wrap")"
+                ka_block="$blk"
+            fi
             run rm -f "$wrap"
             run mv -f "$f" "$wrap"
         else
@@ -1148,6 +1180,10 @@ apply_wrappers() {
         write_wrapper "$f"
         count=$((count + 1))
     done
+    if [ "$OPT_DRY_RUN" -eq 0 ] && [ -n "$ka_block" ] && [ -f "$BIN_DIR/$ka_prog" ]; then
+        inject_keepalive "$BIN_DIR/$ka_prog" "$ka_block"
+        ok "已保留 sangfor-vdi-keepalive 的注入（$ka_prog）"
+    fi
     ok "已包装 $count 个可执行文件"
 }
 

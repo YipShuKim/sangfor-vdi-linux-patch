@@ -71,6 +71,10 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 
 前置条件是**已经跑过某个主补丁的 `apply`**：它会把 `bin/` 下的原生二进制改成
 「包装脚本 + `.real`」，保活补丁才有注入点。
+反过来也成立：**重跑主补丁的 `apply` 不会把保活弄丢**。主补丁重建包装脚本时会先把
+`# >>> sangfor-vdi-keepalive` 那一段原样取出、重建后再放回（早期版本会被整段覆盖，
+表现为"明明开了保活还是 20 分钟准时登出"）。客户端升级后 `bin/` 被覆盖，仍需重跑
+主补丁 `apply` + 保活 `apply`。
 
 ## 三份补丁各做什么
 
@@ -223,6 +227,8 @@ sudo BIONIC_BASE=http://mirror.example.com/ubuntu/pool ./sangfor-vdi-ubuntu appl
 **升级客户端后又要重新打补丁？**
 是。客户端升级会覆盖 `bin/` 下的文件，重跑一次主补丁的 `apply` 即可（幂等）。重装后 `bin/`
 里是原生二进制、旧的 `.real` 还在，`apply` 会识别并丢弃这些过期副本，不会把客户端降级。
+升级会丢掉保活的 `LD_PRELOAD` 注入（新版 `apply` 会保留它，但原生二进制上本来就没有），
+所以升级后请再跑一次 `sangfor-vdi-keepalive apply`。
 
 **一长串 `no version information available` 要处理吗？**
 不用。这是客户端内置 OpenSSL 1.0.2k 没有符号版本表导致的提示，库本身能正常加载。
