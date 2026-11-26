@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+#
+# sangfor-vdi-xkbcompat
+#
+# 修复 Wayland / XWayland 会话下，云桌面里方向键 / Home / End / Insert / Delete 等
+# “扩展键”映射错乱或失效的问题（独立补丁，仅 Wayland 需要，Xorg 会话不需要）。
+#
+# 背景（实测结论，客户端 5.9.6.2154 + Xwayland 24.1）：
+#   - 症状：本地一切正常，但进了虚拟机后 ↑↓←→ / Home / End / Insert / Delete 无效或错乱，
+#     字母数字、空格、回车、Tab 正常
+#   - 抓包显示：客户端把 ↑ 发成 E0 37(PrintScreen)、↓ 发成 E0 5C(右Win)、End 发成 E0 5B(左Win)，
+#     → / Insert / Delete 干脆不发；而 a/空格/回车/Tab 的扫描码全对（= keycode-8）
+#   - 根因：旧版 spice/gtk-vnc 用
+#         desc    = XkbGetKeyboard(dpy, ..., XkbUseCoreKbd);
+#         keycodes= XGetAtomName(dpy, desc->names->keycodes);
+#         if (strstr(keycodes,"evdev")) 用 evdev 表; else 用 XT 回退表;
+#     而 XWayland 上 XkbGetKeyboard 返回 NULL（freedesktop #89240），即便按 spice-gtk 的
+#     改法用 XkbGetMap+XkbGetNames 重建，组件名 atom（names->keycodes）仍为 None，
+#     于是 strstr 失败退回 XT 表 → 扩展键全错。这是 spice-gtk bug 1512564 的同类问题。
+#
+# 做法：编译一个极小的 LD_PRELOAD 库，只在 vdi_session / rapp_session 进程里：
+#   1. XkbGetKeyboard 返回 NULL 时用 XkbGetMap+XkbGetNames 重建键盘描述；
+#   2. 保证 desc->names->keycodes 这个 atom = "evdev"（XWayland 不提供时补上），
+#      客户端据此选中正确的 evdev 键盘表。
+# 其它进程完全原样透传。
+#
+# 为什么走 /etc/ld.so.preload：vdi_session / rapp_session 带 setuid 位，动态链接器
+# 会忽略 LD_PRELOAD，只能让库出现在所有进程的默认预加载列表里。库内部按进程名自我
+# 限制，非这两个进程直接 return，不做任何事。
+#
+# 用法：
+#   sudo ./sangfor-vdi-xkbcompat apply     # 编译 shim 并写入 /etc/ld.so.preload
+#   sudo ./sangfor-vdi-xkbcompat verify    # 检查 shim、preload、运行中客户端是否已加载
+#   sudo ./sangfor-vdi-xkbcompat revert    # 撤销（移出 preload + 删 shim）
+#
+# 生效方式：apply 后需重新打开一次云桌面（新起 vdi_session）才生效。
+
+set -o pipefail
+
+PATCH_VERSION="1.0"
+
+CLIENT_DIR="/usr/local/sangfor/vdiclient"
+BIN_DIR="$CLIENT_DIR/bin"
+SHIM_DIR="$CLIENT_DIR/compat/shim"
+SHIM_LIB="$SHIM_DIR/libxkbcompat.so"
+SRC_NAME="xkbcompat.c"
+PRELOAD="/etc/ld.so.preload"
+HIT_LOG="/tmp/xkbcompat.log"
+
+OPT_DRY_RUN=0
+OPT_VERBOSE=0
+
+C_RED="" C_GRN="" C_YEL="" C_BLU="" C_RST=""
+if [ -t 1 ]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_BLU=$'\033[34m'; C_RST=$'\033[0m'
+fi
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s[*]%s %s\n' "$C_BLU" "$C_RST" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_YEL" "$C_RST" "$*"; }
+err()  { printf '%s[x]%s %s\n' "$C_RED" "$C_RST" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+dbg()  { [ "$OPT_VERBOSE" -eq 1 ] && printf '[D] %s\n' "$*"; return 0; }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "需要 root 权限，请用 sudo 运行。"; }
+
+run() {
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        printf '[dry-run]'; printf ' %q' "$@"; printf '\n'
+        return 0
+    fi
+    "$@"
+}
+
+shim_source_dir() {
+    local d
+    for d in "$(dirname "$(readlink -f "$0")")/shim" "./shim"; do
+        [ -f "$d/$SRC_NAME" ] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+# vdi_session 是否带 setuid（用来解释为什么必须用 ld.so.preload）
+has_setuid_session() {
+    local f
+    for f in "$BIN_DIR"/vdi_session "$BIN_DIR"/vdi_session.real \
+             "$BIN_DIR"/rapp_session "$BIN_DIR"/rapp_session.real; do
+        [ -f "$f" ] && [ -u "$f" ] && return 0
+    done
+    return 1
+}
+
+build_shim() {
+    local src cc
+    src="$(shim_source_dir)" || die "找不到 shim 源码 $SRC_NAME（应与本脚本同级的 shim/ 目录）"
+    cc="$(command -v cc || command -v gcc || true)"
+    [ -n "$cc" ] || die "未找到 C 编译器，请先安装 gcc"
+    # 需要 libX11 头文件（Fedora: libX11-devel，Debian/Ubuntu: libx11-dev）
+    run mkdir -p "$SHIM_DIR"
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] $cc -shared -fPIC -O2 -o $SHIM_LIB $src/$SRC_NAME -ldl -lX11"
+        return 0
+    fi
+    if ! "$cc" -shared -fPIC -O2 -Wall -o "$SHIM_LIB" "$src/$SRC_NAME" -ldl -lX11 2>/tmp/.xkbcompat.build.err; then
+        err "shim 编译失败。若提示找不到 X11/XKBlib.h，请安装 libX11 开发包："
+        err "  Fedora: sudo dnf install -y libX11-devel    Debian/Ubuntu: sudo apt install -y libx11-dev"
+        sed 's/^/    /' /tmp/.xkbcompat.build.err >&2 || true
+        rm -f /tmp/.xkbcompat.build.err
+        die "编译中止"
+    fi
+    rm -f /tmp/.xkbcompat.build.err
+    chown 0:0 "$SHIM_LIB" 2>/dev/null || true
+    chmod 755 "$SHIM_LIB"
+    ok "shim 已编译: $SHIM_LIB"
+}
+
+preload_has() { [ -f "$PRELOAD" ] && grep -qxF "$SHIM_LIB" "$PRELOAD"; }
+
+add_preload() {
+    if preload_has; then
+        ok "已在 $PRELOAD 中，跳过"
+        return 0
+    fi
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 向 $PRELOAD 追加一行 $SHIM_LIB"
+        return 0
+    fi
+    [ -f "$PRELOAD" ] || { : > "$PRELOAD"; chmod 644 "$PRELOAD"; }
+    printf '%s\n' "$SHIM_LIB" >> "$PRELOAD"
+    chown 0:0 "$PRELOAD" 2>/dev/null || true
+    chmod 644 "$PRELOAD"
+    ok "已写入 $PRELOAD"
+}
+
+del_preload() {
+    [ -f "$PRELOAD" ] || { info "$PRELOAD 不存在"; return 0; }
+    grep -qxF "$SHIM_LIB" "$PRELOAD" 2>/dev/null || { info "$PRELOAD 中没有本补丁的记录"; return 0; }
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log "[dry-run] 从 $PRELOAD 移除 $SHIM_LIB"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    grep -vxF "$SHIM_LIB" "$PRELOAD" > "$tmp" || true
+    if [ -s "$tmp" ]; then
+        chown 0:0 "$tmp" 2>/dev/null || true; chmod 644 "$tmp"; mv -f "$tmp" "$PRELOAD"
+    else
+        rm -f "$tmp" "$PRELOAD"
+    fi
+    ok "已从 $PRELOAD 移除本补丁记录"
+}
+
+do_apply() {
+    need_root
+    log "sangfor-vdi-xkbcompat $PATCH_VERSION"
+    [ -d "$CLIENT_DIR" ] || die "未找到 $CLIENT_DIR，请先安装 VDI 客户端"
+
+    if ! has_setuid_session; then
+        warn "未在 $BIN_DIR 找到带 setuid 的 vdi_session/rapp_session，"
+        warn "本补丁针对的就是它们；如果入口文件名不同仍需它，本补丁可能不必要。"
+    fi
+
+    build_shim
+    add_preload
+
+    if [ "$OPT_DRY_RUN" -eq 1 ]; then
+        log ""
+        log "[dry-run] 上面是将执行的动作，未改动任何文件"
+        return 0
+    fi
+
+    log ""
+    ok "键盘兼容 shim 已启用（仅作用于 vdi_session / rapp_session）"
+    info "需要重新打开一次云桌面（新起 vdi_session）才生效。"
+    info "原理：XWayland 下把键盘描述的 keycodes 名补成 evdev，让客户端走正确的 evdev 扫描码表。"
+}
+
+do_verify() {
+    local rc=0 pid n
+
+    if [ -f "$SHIM_LIB" ]; then
+        ok "shim 已编译: $SHIM_LIB"
+    else
+        err "shim 不存在: $SHIM_LIB（先运行 apply）"
+        rc=1
+    fi
+
+    if preload_has; then
+        ok "$PRELOAD 已包含 shim"
+    else
+        err "$PRELOAD 未包含 shim（apply 未完成）"
+        rc=1
+    fi
+
+    # 运行中的 vdi_session / rapp_session 是否加载了 shim
+    local found=0
+    for pid in $(pgrep -f "vdiclient/bin/(vdi_session|rapp_session)" 2>/dev/null); do
+        found=1
+        if grep -qa "libxkbcompat" "/proc/$pid/maps" 2>/dev/null; then
+            ok "运行中的 vdi_session/rapp_session（pid $pid）已加载 shim"
+        else
+            warn "运行中的 vdi_session/rapp_session（pid $pid）未加载 shim —— 重新打开云桌面后生效"
+        fi
+    done
+    [ "$found" -eq 0 ] && info "当前没有运行中的云桌面会话（下次打开时生效）"
+
+    # 命中日志（有则说明客户端确实调到了修正后的 keymap）
+    if [ -s "$HIT_LOG" ]; then
+        n="$(grep -c "rebuild\|forced\|names already ok" "$HIT_LOG" 2>/dev/null || echo 0)"
+        ok "命中日志 $HIT_LOG 有 $n 条记录（说明客户端已调用修正逻辑）"
+    else
+        info "暂无命中日志（重新打开云桌面后应出现 $HIT_LOG）"
+    fi
+
+    return "$rc"
+}
+
+do_revert() {
+    need_root
+    log "将撤销键盘兼容 shim："
+    log "  - 从 $PRELOAD 移除 $SHIM_LIB"
+    log "  - 删除 $SHIM_LIB"
+    del_preload
+    run rm -f "$SHIM_LIB"
+    if [ "$OPT_DRY_RUN" -eq 0 ]; then
+        rmdir "$SHIM_DIR" 2>/dev/null || true
+        rm -f "$HIT_LOG" 2>/dev/null || true
+    fi
+    ok "已撤销（重新打开云桌面后回到原始行为）"
+}
+
+usage() {
+    cat <<EOF
+sangfor-vdi-xkbcompat $PATCH_VERSION
+
+修复 Wayland/XWayland 会话下云桌面里方向键 / Home / End / Insert / Delete 失效或错乱。
+Xorg 会话不需要本补丁。
+
+用法: $(basename "$0") <命令> [选项]
+
+命令:
+  apply     编译 shim 并写入 /etc/ld.so.preload（需重新打开云桌面生效）
+  verify    检查 shim、preload 以及运行中的会话是否已加载
+  revert    从 preload 移除并删除 shim
+
+选项:
+  --dry-run     只打印将执行的操作
+  -v, --verbose 输出调试信息
+  -h, --help    显示帮助
+
+前置条件:
+  - 客户端已安装
+  - 已安装 C 编译器与 libX11 开发头文件
+      Fedora: dnf install -y gcc libX11-devel    Debian/Ubuntu: apt install -y gcc libx11-dev
+
+说明:
+  因为 vdi_session / rapp_session 带 setuid，只能通过 /etc/ld.so.preload 让库生效。
+  shim 内部按进程名自我限制，仅对这两个进程起作用，其它进程原样透传。
+
+示例:
+  sudo ./sangfor-vdi-xkbcompat apply
+  sudo ./sangfor-vdi-xkbcompat verify
+  sudo ./sangfor-vdi-xkbcompat revert
+EOF
+}
+
+main() {
+    local cmd=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            apply|verify|revert) [ -z "$cmd" ] && cmd="$1" ;;
+            --dry-run) OPT_DRY_RUN=1 ;;
+            -v|--verbose) OPT_VERBOSE=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) err "未知参数: $1"; usage; exit 2 ;;
+        esac
+        shift
+    done
+    [ -z "$cmd" ] && { usage; exit 2; }
+    case "$cmd" in
+        apply)  do_apply ;;
+        verify) do_verify ;;
+        revert) do_revert ;;
+    esac
+}
+
+main "$@"
