@@ -11,9 +11,10 @@ Fedora 40+ 等新系统上装得上、连得通。**
 |---|---|---|
 | `sangfor-vdi-ubuntu` | Ubuntu / Debian / Mint 等 deb 系 | **只做兼容库**：OpenLDAP 2.4、OpenSSL 1.0、Qt4、系统识别、setuid 程序的库路径。客户端用 apt 正常安装 |
 | `sangfor-vdi-fedora` | Fedora / RHEL 系 | **从装客户端开始**：解官方 Ubuntu deb、执行其 `postinst`、装系统缺包，再打 Fedora 需要的兼容补丁 |
+| `sangfor-vdi-xkbcompat` | **Wayland 会话必装**（Xorg 不需要） | 修复云桌面里 ↑↓←→ / Home / End / Insert / Delete 等扩展键失效或错乱（XWayland 键盘描述 bug）。独立文件，可单独开关 |
 | `sangfor-vdi-keepalive` | 均可（可选） | 关闭客户端 20 分钟固定计时登出。独立文件，可单独开关 |
 
-`shim/` 目录下是上述补丁编译用到的 C 源码（OpenLDAP 桩库、保活 shim），不需要手动处理。
+`shim/` 目录下是上述补丁编译用到的 C 源码（OpenLDAP 桩库、保活 shim、Wayland 键盘 shim），不需要手动处理。
 
 ## 快速开始
 
@@ -124,6 +125,45 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 - 启用后**会弱化组织的信息安全策略**（防止无人看管时桌面继续在线）。启用前请确认符合
   所在机构的规定；更合规的做法是让管理员在 VDC 控制台调大或关掉该策略值。
 
+### `sangfor-vdi-xkbcompat`：修复 Wayland 下方向键 / 扩展键失效
+
+**只在使用 Wayland 会话（含 XWayland）时需要；Xorg 会话不需要。**
+
+症状：云桌面里 ↑↓←→ / Home / End / Insert / Delete 失效或错乱，而字母数字、空格、回车、
+Tab 都正常；本地一切正常，只在虚拟机里不行。抓包（客户端 5.9.6.2154 + Xwayland 24.1）实测
+客户端发出去的是错的扫描码：`↑`→`E0 37`(PrintScreen)、`↓`→`E0 5C`(右Win)、`End`→`E0 5B`(左Win)，
+`→`/`Insert`/`Delete` 干脆不发；而 `a`/空格/回车/Tab 全对（= keycode−8）。
+
+根因：客户端沿用旧版 spice/gtk-vnc 的键盘类型探测逻辑——
+
+```c
+desc     = XkbGetKeyboard(dpy, ..., XkbUseCoreKbd);
+keycodes = XGetAtomName(dpy, desc->names->keycodes);
+if (strstr(keycodes, "evdev")) 用 evdev 表;   // 正确
+else                           用 XT 回退表;  // 扩展键全错
+```
+
+而 XWayland 上 `XkbGetKeyboard` 返回 NULL（freedesktop #89240），即便按 spice-gtk 2015 年
+的改法用 `XkbGetMap`+`XkbGetNames` 重建，组件名 atom（`names->keycodes`）仍是 `None`，
+`strstr` 失败 → 退回 XT 表。这是 spice-gtk bug **1512564「Xwayland reports keycode mapping
+unnamed, messes up spice VM keyboard」** 的同类问题，官方 spice-gtk/QEMU 早已修，只有这个
+闭源客户端没有。
+
+实现：`shim/xkbcompat.c` 编译成 `LD_PRELOAD` 库，只在 `vdi_session` / `rapp_session` 进程中：
+
+1. `XkbGetKeyboard` 返回 NULL 时用 `XkbGetMap`+`XkbGetNames(XkbAllNamesMask)` 重建键盘描述；
+2. 保证 `desc->names->keycodes` 这个 atom = `"evdev"`（XWayland 不提供时补上），
+   客户端据此选中正确的 evdev 扫描码表。
+
+其它进程完全原样透传（非这两个进程直接 return）。
+
+因为 `vdi_session` / `rapp_session` 带 setuid 位，动态链接器会忽略 `LD_PRELOAD`，所以只能
+通过 **`/etc/ld.so.preload`** 让库生效（与当初 setuid 程序加载 OpenLDAP 2.4 同一个道理）。
+shim 内部按进程名自我限制，仅对这两个进程起作用。`revert` 会移除该 preload 行并删除 shim。
+
+生效方式：`apply` 后需**重新打开一次云桌面**（新起 `vdi_session`）。验证可看 `verify` 输出，
+或 `/tmp/xkbcompat.log`（客户端每次调用修正逻辑都会记一行）。
+
 ## 命令与选项
 
 三个脚本的参数一致：`-y/--yes` 不询问、`--dry-run` 只打印、`-v/--verbose` 调试信息、`-h/--help`。
@@ -151,6 +191,12 @@ sudo ./sangfor-vdi-keepalive revert    # 恢复厂商默认
 | `apply` | 编译 shim 并把 `LD_PRELOAD` 注入 `bin/vdi_client` 包装脚本 |
 | `verify` | 检查 shim、注入范围、运行中的客户端是否已加载 |
 | `revert` | 移除注入并删除 shim |
+
+| `sangfor-vdi-xkbcompat` | 作用 |
+|---|---|
+| `apply` | 编译 shim 并写入 `/etc/ld.so.preload`（需重新打开云桌面生效） |
+| `verify` | 检查 shim、preload 记录，以及运行中的会话是否已加载 |
+| `revert` | 从 preload 移除记录并删除 shim |
 
 ## 兼容库从哪来
 
@@ -249,6 +295,12 @@ sudo systemctl disable --now vdi_usbipd
 **Wayland 会话能用吗？**
 能。客户端是 Qt4/X11 程序，通过 XWayland 运行；实测 Fedora 45（默认 Wayland）下登录框正常
 显示。仅有一条 `QGtkStyle could not resolve GTK` 的无害提示。
+**但 Wayland 下必须装 `sangfor-vdi-xkbcompat`**，否则云桌面里方向键 / Home / End / Insert /
+Delete 等扩展键会失效或错乱（XWayland 键盘描述 bug，见上）。
+
+**进了云桌面后方向键 / Home / End / Insert / Delete 不管用，但字母数字正常？**
+这是 XWayland 下客户端把扩展键翻译成错误扫描码（或直接丢弃）导致的，不是网络也不是我们
+其它补丁的问题。装 `sangfor-vdi-xkbcompat` 并重新打开一次云桌面即可；Xorg 会话没有这个问题。
 
 **登录时报"登录异常，请检查网络和服务器地址"？**
 这个提示名不副实，实际与网络无关：登录前的请求都发往 `127.0.0.1:31113`，那是本地
@@ -318,6 +370,7 @@ sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor
   需要自行清理。
 - 仅适配 glibc 系（Debian/Ubuntu/Fedora 等），不适用于 musl 发行版（Alpine 等）。
 - 保活 shim 与客户端版本绑定，升级后自动失效（回到厂商默认行为）。
+- `sangfor-vdi-xkbcompat` 只影响 `vdi_session`/`rapp_session`，但通过 `/etc/ld.so.preload` 全局预加载；shim 内部按进程名自我限制，其它进程不做任何事（文件写错 glibc 只会打印一行 `cannot be preloaded` 并继续，不会导致无法开机）。
 
 ## 免责声明
 
